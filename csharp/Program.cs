@@ -6,7 +6,7 @@ using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
-// ── single instance mutex ──────────────────────────────────────────────────
+// ── single instance ────────────────────────────────────────────────────────
 using var mutex = new Mutex(true, "Global\\ClaudeTray_SingleInstance", out bool isFirst);
 if (!isFirst)
 {
@@ -24,7 +24,7 @@ Application.Run(new TrayContext());
 class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon _tray;
-    private readonly RateLimitStore _limits = new();
+    private readonly RateLimitStore _store = new();
     private readonly LogWatcher _watcher;
 
     private static readonly string[] Palette =
@@ -41,18 +41,15 @@ class TrayContext : ApplicationContext
     public TrayContext()
     {
         _tray = new NotifyIcon { Visible = true };
-
-        _watcher = new LogWatcher(onRateLimitDetected: OnRateLimitDetected);
+        _watcher = new LogWatcher(OnRateLimitDetected);
         _watcher.Start();
-
         Refresh();
     }
 
-    // ── rate-limit event (called from background thread) ───────────────────
+    // ── rate limit callback (background thread) ────────────────────────────
 
     void OnRateLimitDetected()
     {
-        // marshal to UI thread
         if (Application.OpenForms.Count > 0)
             Application.OpenForms[0]!.BeginInvoke(HandleRateLimit);
         else
@@ -63,27 +60,19 @@ class TrayContext : ApplicationContext
     {
         var accounts = ParseAccounts();
         var active = accounts.FirstOrDefault(a => a.Active);
-        if (active is null) return;
+        if (active is null || _store.IsLimited(active.Email)) return;
 
-        // already marked — avoid duplicate handling
-        if (_limits.IsLimited(active.Email)) return;
-
-        _limits.MarkLimited(active.Email);
+        _store.MarkLimited(active.Email);
         Refresh();
 
-        if (_limits.AutoSwitch)
+        if (_store.AutoSwitch)
         {
-            var next = accounts.FirstOrDefault(a => !a.Active && !_limits.IsLimited(a.Email));
-            if (next is not null)
-            {
-                SwitchTo(next.Num, next.Email, autoRestart: true);
-                return;
-            }
+            var next = accounts.FirstOrDefault(a => !a.Active && !_store.IsLimited(a.Email));
+            if (next is not null) { SwitchTo(next.Num, next.Email, autoRestart: true); return; }
         }
 
-        _tray.ShowBalloonTip(5000, "Rate limit detected",
-            $"{active.Email} hit its limit.\nSwitch accounts from the tray.",
-            ToolTipIcon.Warning);
+        _tray.ShowBalloonTip(5000, "Rate limit hit",
+            $"{active.Email} is rate limited.\nSwitch accounts from the tray.", ToolTipIcon.Warning);
     }
 
     // ── cswap ──────────────────────────────────────────────────────────────
@@ -97,9 +86,9 @@ class TrayContext : ApplicationContext
             UseShellExecute = false,
             CreateNoWindow = true,
         })!;
-        var output = p.StandardOutput.ReadToEnd();
+        var text = p.StandardOutput.ReadToEnd();
         p.WaitForExit();
-        return output;
+        return text;
     }
 
     List<Account> ParseAccounts()
@@ -107,36 +96,35 @@ class TrayContext : ApplicationContext
         var result = new List<Account>();
         try
         {
-            var text = RunCmd("cswap", "--list");
-            foreach (var line in text.Split('\n'))
+            foreach (var line in RunCmd("cswap", "--list").Split('\n'))
             {
                 var m = Regex.Match(line.Trim(), @"^(\d+):\s+(.+?)(\s+\(active\))?\s*$");
                 if (m.Success)
-                    result.Add(new(
-                        int.Parse(m.Groups[1].Value),
-                        m.Groups[2].Value.Trim(),
-                        m.Groups[3].Success));
+                    result.Add(new(int.Parse(m.Groups[1].Value),
+                        m.Groups[2].Value.Trim(), m.Groups[3].Success));
             }
         }
         catch { }
         return result;
     }
 
-    // ── UI refresh ─────────────────────────────────────────────────────────
+    // ── refresh ────────────────────────────────────────────────────────────
 
     void Refresh()
     {
         var accounts = ParseAccounts();
         var active = accounts.FirstOrDefault(a => a.Active);
-        bool activeLimited = active is not null && _limits.IsLimited(active.Email);
+        bool limited = active is not null && _store.IsLimited(active.Email);
+
+        // auto-clear expired limits
+        foreach (var acc in accounts)
+            if (_store.IsExpired(acc.Email)) _store.ClearLimit(acc.Email);
 
         _tray.Icon?.Dispose();
-        _tray.Icon = BuildTrayIcon(active, activeLimited);
-
+        _tray.Icon = BuildTrayIcon(active, limited);
         _tray.Text = active is not null
-            ? $"Claude: {active.Email}{(activeLimited ? " ⚠" : "")}"
+            ? $"Claude: {active.Email}{(limited ? " ⚠ rate limited" : "")}"
             : "Claude Account Switcher";
-
         _tray.ContextMenuStrip = BuildMenu(accounts, active);
     }
 
@@ -145,78 +133,125 @@ class TrayContext : ApplicationContext
     ContextMenuStrip BuildMenu(List<Account> accounts, Account? active)
     {
         var menu = new ContextMenuStrip();
+        menu.Font = new Font("Segoe UI", 9f);
 
-        // header
+        // ── active account header ──
+        bool activeLimited = active is not null && _store.IsLimited(active.Email);
+        string headerIcon = activeLimited ? "⚠" : "●";
         string headerText = active is not null
-            ? (_limits.IsLimited(active.Email) ? $"⚠  {active.Email}" : $"●  {active.Email}")
+            ? $"{headerIcon}  {active.Email}"
             : "No active account";
-        menu.Items.Add(new ToolStripMenuItem(headerText)
+
+        var header = new ToolStripMenuItem(headerText)
         {
             Enabled = false,
-            Font = new Font(SystemFonts.MenuFont!, FontStyle.Bold),
-        });
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            ForeColor = activeLimited ? Color.OrangeRed : SystemColors.ControlText,
+        };
+        menu.Items.Add(header);
+
+        // ── rate limit progress bar (only when limited) ──
+        if (activeLimited && active is not null)
+        {
+            var since = _store.LimitedAt(active.Email);
+            if (since.HasValue)
+            {
+                var elapsed = DateTime.Now - since.Value;
+                var window = TimeSpan.FromHours(_store.ResetHours);
+                var remaining = window - elapsed;
+                if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
+                int pct = (int)Math.Min(100, elapsed.TotalSeconds / window.TotalSeconds * 100);
+
+                // label
+                string remainStr = remaining.TotalMinutes < 1
+                    ? "resets soon"
+                    : remaining.TotalHours >= 1
+                        ? $"resets in {(int)remaining.TotalHours}h {remaining.Minutes:D2}m"
+                        : $"resets in {(int)remaining.TotalMinutes}m";
+
+                var lbl = new ToolStripMenuItem(remainStr)
+                {
+                    Enabled = false,
+                    ForeColor = Color.OrangeRed,
+                    Font = new Font("Segoe UI", 8f),
+                    Padding = new Padding(22, 0, 4, 0),
+                };
+                menu.Items.Add(lbl);
+
+                // progress bar (fills left→right as time-to-reset counts down)
+                var pb = new ToolStripProgressBar
+                {
+                    Minimum = 0,
+                    Maximum = 100,
+                    Value = 100 - pct,   // full = just limited, empty = about to reset
+                    Size = new Size(160, 14),
+                    Margin = new Padding(26, 2, 8, 4),
+                    Style = ProgressBarStyle.Continuous,
+                };
+                menu.Items.Add(pb);
+            }
+        }
+
         menu.Items.Add(new ToolStripSeparator());
 
-        // accounts
+        // ── account list ──
         foreach (var acc in accounts)
         {
-            bool limited = _limits.IsLimited(acc.Email);
-            string prefix = acc.Active ? "✓  " : "    ";
-            string suffix = limited ? "  ⚠" : "";
-            var mi = new ToolStripMenuItem($"{prefix}{acc.Email}{suffix}");
+            bool limited = _store.IsLimited(acc.Email);
+            string status = limited
+                ? $"  ⚠ {FormatRemaining(acc.Email)}"
+                : "";
+
+            string label = (acc.Active ? "✓  " : "     ") + acc.Email + status;
+            var mi = new ToolStripMenuItem(label);
 
             if (limited) mi.ForeColor = Color.OrangeRed;
-            if (acc.Active) mi.Enabled = false;
-            else { var num = acc.Num; var email = acc.Email; mi.Click += (_, _) => SwitchTo(num, email); }
+
+            if (acc.Active)
+            {
+                mi.Enabled = false;
+            }
+            else
+            {
+                var num = acc.Num; var email = acc.Email;
+                mi.Click += (_, _) => SwitchTo(num, email);
+            }
+
+            // right-click submenu: mark / clear limit
+            var markItem = new ToolStripMenuItem("Mark as rate limited");
+            markItem.Enabled = !limited;
+            markItem.Click += (_, _) => { _store.MarkLimited(acc.Email); Refresh(); };
+
+            var clearItem = new ToolStripMenuItem(limited
+                ? $"Clear rate limit  (since {_store.LimitedAt(acc.Email):HH:mm})"
+                : "Clear rate limit");
+            clearItem.Enabled = limited;
+            clearItem.Click += (_, _) => { _store.ClearLimit(acc.Email); Refresh(); };
+
+            mi.DropDownItems.Add(markItem);
+            mi.DropDownItems.Add(clearItem);
 
             menu.Items.Add(mi);
         }
 
         menu.Items.Add(new ToolStripSeparator());
 
-        // rate limit submenu per account
-        if (accounts.Count > 0)
-        {
-            var limitsMenu = new ToolStripMenuItem("Rate limits");
-            foreach (var acc in accounts)
-            {
-                bool limited = _limits.IsLimited(acc.Email);
-                var sub = new ToolStripMenuItem(acc.Email);
-
-                var mark = new ToolStripMenuItem("Mark as limited");
-                mark.Enabled = !limited;
-                mark.Click += (_, _) => { _limits.MarkLimited(acc.Email); Refresh(); };
-
-                var clear = new ToolStripMenuItem(limited
-                    ? $"Clear  (since {_limits.LimitedSince(acc.Email):HH:mm})"
-                    : "Clear");
-                clear.Enabled = limited;
-                clear.Click += (_, _) => { _limits.ClearLimit(acc.Email); Refresh(); };
-
-                sub.DropDownItems.Add(mark);
-                sub.DropDownItems.Add(clear);
-                limitsMenu.DropDownItems.Add(sub);
-            }
-            menu.Items.Add(limitsMenu);
-        }
-
-        // auto-switch toggle
+        // ── auto-switch toggle ──
         var autoSwitch = new ToolStripMenuItem("Auto-switch on rate limit")
         {
-            Checked = _limits.AutoSwitch,
+            Checked = _store.AutoSwitch,
             CheckOnClick = true,
         };
-        autoSwitch.CheckedChanged += (_, _) => { _limits.AutoSwitch = autoSwitch.Checked; };
+        autoSwitch.CheckedChanged += (_, _) => { _store.AutoSwitch = autoSwitch.Checked; };
         menu.Items.Add(autoSwitch);
 
         menu.Items.Add(new ToolStripSeparator());
 
-        // add account
+        // ── account management ──
         var add = new ToolStripMenuItem("Add account…");
         add.Click += (_, _) => AddAccount();
         menu.Items.Add(add);
 
-        // remove account submenu
         if (accounts.Count > 0)
         {
             var removeMenu = new ToolStripMenuItem("Remove account");
@@ -245,52 +280,57 @@ class TrayContext : ApplicationContext
         return menu;
     }
 
+    string FormatRemaining(string email)
+    {
+        var since = _store.LimitedAt(email);
+        if (!since.HasValue) return "";
+        var rem = TimeSpan.FromHours(_store.ResetHours) - (DateTime.Now - since.Value);
+        if (rem <= TimeSpan.Zero) return "resets soon";
+        return rem.TotalHours >= 1
+            ? $"{(int)rem.TotalHours}h {rem.Minutes:D2}m"
+            : $"{(int)rem.TotalMinutes}m";
+    }
+
     // ── actions ────────────────────────────────────────────────────────────
 
     void SwitchTo(int num, string email, bool autoRestart = false)
     {
         RunCmd("cswap", $"--switch-to {num}");
         Refresh();
-
         if (autoRestart)
         {
             _tray.ShowBalloonTip(4000, "Auto-switched",
-                $"Rate limit detected → switched to {email}.\nRestarting Claude Code…",
-                ToolTipIcon.Info);
+                $"Switched to {email}.\nRestarting Claude Code…", ToolTipIcon.Info);
             Thread.Sleep(1500);
             RestartClaude();
         }
         else
         {
-            _tray.ShowBalloonTip(3000, "Claude Account Switcher",
-                $"Switched to {email}\nRestart Claude Code to apply.", ToolTipIcon.Info);
+            _tray.ShowBalloonTip(3000, "Switched",
+                $"Now using {email}\nRestart Claude Code to apply.", ToolTipIcon.Info);
         }
     }
 
     void AddAccount()
     {
-        var dlg = MessageBox.Show(
+        if (MessageBox.Show(
             "Log into the new account in Claude Code first.\n\n" +
             "  claude /logout\n  claude /login\n\n" +
             "Click OK when done.",
-            "Add Account", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
-        if (dlg != DialogResult.OK) return;
+            "Add Account", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
 
         var output = RunCmd("cswap", "--add-account").Trim();
         Refresh();
-        _tray.ShowBalloonTip(3000, "Add Account",
-            output.Length > 0 ? output : "Done.", ToolTipIcon.Info);
+        _tray.ShowBalloonTip(3000, "Add Account", output.Length > 0 ? output : "Done.", ToolTipIcon.Info);
     }
 
     void RemoveAccount(int num, string email)
     {
-        var dlg = MessageBox.Show(
-            $"Remove account {email}?",
-            "Remove Account", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (dlg != DialogResult.Yes) return;
+        if (MessageBox.Show($"Remove account {email}?", "Remove Account",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
 
         RunCmd("cswap", $"--remove-account {num}");
-        _limits.ClearLimit(email);
+        _store.ClearLimit(email);
         Refresh();
         _tray.ShowBalloonTip(2000, "Remove Account", $"Removed {email}.", ToolTipIcon.Info);
     }
@@ -306,57 +346,42 @@ class TrayContext : ApplicationContext
         });
     }
 
-    // ── icon building ──────────────────────────────────────────────────────
+    // ── tray icon ──────────────────────────────────────────────────────────
 
     Icon BuildTrayIcon(Account? active, bool limited)
     {
         const int size = 32;
-        var claudeIcon = TryLoadClaudeIcon();
+        var base_ = TryLoadClaudeIcon();
+        var badgeColor = limited ? Color.OrangeRed
+            : active is not null ? ParseHex(Palette[(active.Num - 1) % Palette.Length])
+            : Color.FromArgb(0x66, 0x66, 0x66);
+        var badgeLetter = limited ? "!" : active is not null ? active.Email[0].ToString().ToUpper() : "C";
 
-        if (claudeIcon is null)
-        {
-            var color = limited ? Color.OrangeRed
-                : active is not null ? ParseHex(Palette[(active.Num - 1) % Palette.Length])
-                : Color.FromArgb(0x44, 0x44, 0x44);
-            var letter = limited ? "!" : active is not null ? active.Email[0].ToString().ToUpper() : "C";
-            return MakeLetterIcon(letter, color, size);
-        }
-
-        if (active is null) return claudeIcon;
-
-        var badgeColor = limited ? Color.OrangeRed : ParseHex(Palette[(active.Num - 1) % Palette.Length]);
-        var badgeLetter = limited ? "!" : active.Email[0].ToString().ToUpper();
-        return OverlayBadge(claudeIcon, badgeLetter, badgeColor, size);
+        if (base_ is null) return MakeLetterIcon(badgeLetter, badgeColor, size);
+        if (active is null) return base_;
+        return OverlayBadge(base_, badgeLetter, badgeColor, size);
     }
 
     static Icon? TryLoadClaudeIcon()
     {
-        try
-        {
-            if (!File.Exists(ClaudeExe)) return null;
-            return Icon.ExtractAssociatedIcon(ClaudeExe);
-        }
+        try { return File.Exists(ClaudeExe) ? Icon.ExtractAssociatedIcon(ClaudeExe) : null; }
         catch { return null; }
     }
 
-    static Icon OverlayBadge(Icon baseIcon, string letter, Color badgeColor, int size)
+    static Icon OverlayBadge(Icon baseIcon, string letter, Color color, int size)
     {
         using var bmp = new Bitmap(baseIcon.ToBitmap(), size, size);
         using var g = Graphics.FromImage(bmp);
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-
         const int b = 14;
         int x = size - b - 1, y = size - b - 1;
         g.FillEllipse(Brushes.Black, x - 1, y - 1, b + 2, b + 2);
-        g.FillEllipse(new SolidBrush(badgeColor), x, y, b, b);
-
+        g.FillEllipse(new SolidBrush(color), x, y, b, b);
         using var font = new Font("Arial", 7, FontStyle.Bold);
         var sz = g.MeasureString(letter, font);
         g.DrawString(letter, font, Brushes.White,
-            x + (b - sz.Width) / 2f,
-            y + (b - sz.Height) / 2f - 0.5f);
-
+            x + (b - sz.Width) / 2f, y + (b - sz.Height) / 2f - 0.5f);
         return Icon.FromHandle(bmp.GetHicon());
     }
 
@@ -379,63 +404,54 @@ class TrayContext : ApplicationContext
         Convert.ToInt32(hex[3..5], 16),
         Convert.ToInt32(hex[5..7], 16));
 
-    // ── cleanup ────────────────────────────────────────────────────────────
-
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
-        {
-            _watcher.Dispose();
-            _tray.Icon?.Dispose();
-            _tray.Dispose();
-        }
+        if (disposing) { _watcher.Dispose(); _tray.Icon?.Dispose(); _tray.Dispose(); }
         base.Dispose(disposing);
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Rate limit store — persisted to ~/.claude/claude-switcher.json
+// Rate limit store  (~/.claude/claude-switcher.json)
 // ══════════════════════════════════════════════════════════════════════════════
 
 class RateLimitStore
 {
-    private static readonly string StorePath = Path.Combine(
+    private static readonly string Path_ = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".claude", "claude-switcher.json");
 
     private Dictionary<string, DateTime> _limits = new();
     private bool _autoSwitch = true;
+    private double _resetHours = 5.0;
 
     public RateLimitStore() => Load();
 
-    public bool AutoSwitch
-    {
-        get => _autoSwitch;
-        set { _autoSwitch = value; Save(); }
-    }
+    public bool AutoSwitch   { get => _autoSwitch;  set { _autoSwitch = value;  Save(); } }
+    public double ResetHours { get => _resetHours;  set { _resetHours = value;  Save(); } }
 
     public bool IsLimited(string email) => _limits.ContainsKey(email);
+    public DateTime? LimitedAt(string email) => _limits.TryGetValue(email, out var t) ? t : null;
 
-    public DateTime? LimitedSince(string email) =>
-        _limits.TryGetValue(email, out var t) ? t : null;
+    public bool IsExpired(string email) =>
+        _limits.TryGetValue(email, out var t) &&
+        (DateTime.Now - t).TotalHours >= _resetHours;
 
     public void MarkLimited(string email) { _limits[email] = DateTime.Now; Save(); }
-
-    public void ClearLimit(string email) { _limits.Remove(email); Save(); }
+    public void ClearLimit(string email)  { _limits.Remove(email); Save(); }
 
     void Load()
     {
         try
         {
-            if (!File.Exists(StorePath)) return;
-            var node = JsonNode.Parse(File.ReadAllText(StorePath));
+            if (!File.Exists(Path_)) return;
+            var node = JsonNode.Parse(File.ReadAllText(Path_));
             if (node is null) return;
-
             _autoSwitch = node["autoSwitch"]?.GetValue<bool>() ?? true;
-
-            var limits = node["rateLimits"]?.AsObject();
-            if (limits is not null)
-                foreach (var kv in limits)
+            _resetHours = node["resetHours"]?.GetValue<double>() ?? 5.0;
+            var lim = node["rateLimits"]?.AsObject();
+            if (lim is not null)
+                foreach (var kv in lim)
                     if (DateTime.TryParse(kv.Value?.GetValue<string>(), out var dt))
                         _limits[kv.Key] = dt;
         }
@@ -446,94 +462,85 @@ class RateLimitStore
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(StorePath)!);
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path_)!);
             var obj = new JsonObject
             {
                 ["autoSwitch"] = _autoSwitch,
+                ["resetHours"] = _resetHours,
                 ["rateLimits"] = new JsonObject(
                     _limits.Select(kv =>
                         KeyValuePair.Create<string, JsonNode?>(kv.Key, kv.Value.ToString("o"))))
             };
-            File.WriteAllText(StorePath, obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(Path_, obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Log watcher — watches ~/.claude/ for rate-limit keywords in log files
+// Log watcher  — polls ~/.claude/ for rate-limit keywords
 // ══════════════════════════════════════════════════════════════════════════════
 
 class LogWatcher : IDisposable
 {
-    private readonly Action _onRateLimitDetected;
+    private readonly Action _callback;
     private readonly List<FileSystemWatcher> _watchers = new();
     private DateTime _lastFired = DateTime.MinValue;
 
-    private static readonly string[] WatchPaths =
+    private static readonly string[] WatchDirs =
     [
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"),
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude"),
+        System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"),
+        System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude"),
     ];
 
-    private static readonly Regex RateLimitPattern = new(
+    private static readonly Regex RlPattern = new(
         @"rate.?limit|too many requests|429|quota exceeded|capacity reached|claude is at capacity",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    public LogWatcher(Action onRateLimitDetected)
-    {
-        _onRateLimitDetected = onRateLimitDetected;
-    }
+    public LogWatcher(Action callback) => _callback = callback;
 
     public void Start()
     {
-        foreach (var path in WatchPaths)
+        foreach (var dir in WatchDirs)
         {
             try
             {
-                if (!Directory.Exists(path)) continue;
-                var w = new FileSystemWatcher(path)
+                if (!Directory.Exists(dir)) continue;
+                var w = new FileSystemWatcher(dir)
                 {
                     IncludeSubdirectories = true,
                     NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
                     EnableRaisingEvents = true,
                 };
-                w.Changed += OnFileChanged;
+                w.Changed += OnChanged;
                 _watchers.Add(w);
             }
             catch { }
         }
     }
 
-    void OnFileChanged(object sender, FileSystemEventArgs e)
+    void OnChanged(object _, FileSystemEventArgs e)
     {
-        // debounce: fire at most once per 10 seconds
         if ((DateTime.Now - _lastFired).TotalSeconds < 10) return;
-
         try
         {
             if (!File.Exists(e.FullPath)) return;
-            var ext = Path.GetExtension(e.FullPath).ToLowerInvariant();
+            var ext = System.IO.Path.GetExtension(e.FullPath).ToLower();
             if (ext is not (".log" or ".txt" or ".json" or "")) return;
 
-            // read last 8 KB
             using var fs = new FileStream(e.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            long offset = Math.Max(0, fs.Length - 8192);
-            fs.Seek(offset, SeekOrigin.Begin);
-            using var reader = new StreamReader(fs);
-            var tail = reader.ReadToEnd();
+            fs.Seek(Math.Max(0, fs.Length - 8192), SeekOrigin.Begin);
+            var tail = new StreamReader(fs).ReadToEnd();
 
-            if (RateLimitPattern.IsMatch(tail))
+            if (RlPattern.IsMatch(tail))
             {
                 _lastFired = DateTime.Now;
-                _onRateLimitDetected();
+                _callback();
             }
         }
         catch { }
     }
 
-    public void Dispose()
-    {
-        foreach (var w in _watchers) w.Dispose();
-    }
+    public void Dispose() { foreach (var w in _watchers) w.Dispose(); }
 }
