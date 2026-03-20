@@ -1,0 +1,4 @@
+csharp/bin/
+csharp/obj/
+csharp/publish/
+*.user
