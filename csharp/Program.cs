@@ -281,51 +281,65 @@ class TrayContext : ApplicationContext
     ToolStripItem MakeBarItem(string email, bool limited)
     {
         const int total = 20;
-        string barText;
-        Color barColor;
+        int filled;
+        string statusText;
+        Color fillColor;
 
         if (!limited)
         {
-            barText = new string('█', total) + "  ✓ available";
-            barColor = Color.SeaGreen;
+            filled = total;
+            statusText = "  ✓ available";
+            fillColor = Color.SeaGreen;
         }
         else
         {
             var since = _rateStore.LimitedAt(email);
             if (!since.HasValue)
             {
-                barText = new string('░', total) + "  ⚠ limited";
-                barColor = Color.OrangeRed;
+                filled = 0;
+                statusText = "  ⚠ limited";
+                fillColor = Color.OrangeRed;
             }
             else
             {
                 var window = TimeSpan.FromHours(_rateStore.ResetHours);
                 var elapsed = DateTime.Now - since.Value;
                 if (elapsed > window) elapsed = window;
-                int filled = (int)(elapsed.TotalSeconds / window.TotalSeconds * total);
-                filled = Math.Clamp(filled, 0, total);
-                barText = new string('█', filled) + new string('░', total - filled)
-                          + $"  ⚠ {FormatRemaining(email)}";
-                barColor = Color.OrangeRed;
+                filled = Math.Clamp((int)(elapsed.TotalSeconds / window.TotalSeconds * total), 0, total);
+                statusText = $"  ⚠ {FormatRemaining(email)}";
+                fillColor = Color.OrangeRed;
             }
         }
 
-        var lbl = new Label
+        var font = new Font("Consolas", 8f);
+        var emptyColor = Color.FromArgb(160, 160, 160);
+
+        var panel = new FlowLayoutPanel
         {
-            Text = barText,
-            Font = new Font("Consolas", 8f),
-            ForeColor = barColor,
-            AutoSize = false,
-            Width = 260,
-            Height = 15,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoSize = true,
             BackColor = SystemColors.Menu,
-            Padding = new Padding(0),
-            Margin = new Padding(0),
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
         };
-        return new ToolStripControlHost(lbl)
+
+        void AddLbl(string text, Color color) => panel.Controls.Add(new Label
         {
-            Margin = new Padding(28, 0, 4, 3),
-        };
+            Text = text,
+            Font = font,
+            ForeColor = color,
+            AutoSize = true,
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
+            BackColor = SystemColors.Menu,
+        });
+
+        if (filled > 0) AddLbl(new string('█', filled), fillColor);
+        if (filled < total) AddLbl(new string('░', total - filled), emptyColor);
+        AddLbl(statusText, fillColor);
+
+        return new ToolStripControlHost(panel) { Margin = new Padding(28, 0, 4, 3) };
     }
 
     string FormatRemaining(string email)
