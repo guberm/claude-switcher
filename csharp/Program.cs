@@ -151,6 +151,20 @@ class TrayContext : ApplicationContext
             mi.DropDownItems.Add(clearItem);
             menu.Items.Add(mi);
             menu.Items.Add(MakeBarItem(acc.Email, limited));
+
+            if (limited)
+            {
+                var email2 = acc.Email;
+                var since = _rateStore.LimitedAt(acc.Email);
+                var clearBtn = new ToolStripMenuItem(
+                    $"     ✕  Clear  (marked {since:HH:mm})")
+                {
+                    ForeColor = Color.Gray,
+                    Font = new Font("Segoe UI", 8f),
+                };
+                clearBtn.Click += (_, _) => { _rateStore.ClearLimit(email2); Refresh(); };
+                menu.Items.Add(clearBtn);
+            }
         }
 
         menu.Items.Add(new ToolStripSeparator());
@@ -280,6 +294,7 @@ class TrayContext : ApplicationContext
             $"Switched to {email}.\nRestarting Claude Code…", ToolTipIcon.Info);
         Thread.Sleep(1500);
         RestartClaude();
+        Refresh();
     }
 
     void AddAccount()
@@ -460,8 +475,12 @@ class AccountStore
 
         result.Sort((a, b) => string.Compare(a.Email, b.Email, StringComparison.OrdinalIgnoreCase));
 
+        // Always detect from actual credentials file so the display stays accurate
+        // even if the user switched accounts outside of this tool.
+        var activeEmail = DetectActiveEmail() ?? _activeEmail;
+
         return result
-            .Select((r, i) => new Account(i + 1, r.Email, r.Email == _activeEmail))
+            .Select((r, i) => new Account(i + 1, r.Email, r.Email == activeEmail))
             .ToList();
     }
 
