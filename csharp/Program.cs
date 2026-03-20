@@ -19,7 +19,7 @@ Application.EnableVisualStyles();
 Application.SetCompatibleTextRenderingDefault(false);
 Application.Run(new TrayContext());
 
-record Account(int Num, string Email, bool Active);
+record Account(int Num, string Email, bool Active, string? OrgName = null, string? SubscriptionType = null);
 record AuthStatus(string Email, string? OrgName, string? SubscriptionType);
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -46,7 +46,15 @@ class TrayContext : ApplicationContext
         _watcher.Start();
 
         _refreshTimer = new System.Windows.Forms.Timer { Interval = 30_000 };
-        _refreshTimer.Tick += (_, _) => { _authStatus = GetAuthStatus(); Refresh(); };
+        _refreshTimer.Tick += (_, _) =>
+        {
+            _authStatus = GetAuthStatus();
+            // Keep stored plan in sync for the currently active account.
+            var active = _cached.FirstOrDefault(a => a.Active);
+            if (active is not null && _authStatus is not null)
+                _accounts.UpdatePlan(active.Email, _authStatus.OrgName, _authStatus.SubscriptionType);
+            Refresh();
+        };
         _refreshTimer.Start();
 
         _authStatus = GetAuthStatus();
@@ -146,7 +154,10 @@ class TrayContext : ApplicationContext
 
         // Prefer real email from auth status; fall back to stored active account.
         var displayEmail = _authStatus?.Email is { Length: > 0 } e ? e : active?.Email;
-        var planLabel = FormatPlan(_authStatus);
+        // Use per-account stored plan; fall back to live auth status.
+        var planLabel = active is { OrgName: not null } or { SubscriptionType: not null }
+            ? FormatPlan(active.OrgName, active.SubscriptionType)
+            : FormatPlan(_authStatus);
 
         _tray.Text = displayEmail is not null
             ? $"Claude: {displayEmail}{planLabel}{(limited ? " ⚠ rate limited" : "")}"
@@ -154,15 +165,15 @@ class TrayContext : ApplicationContext
         _tray.ContextMenuStrip = BuildMenu(accounts, active);
     }
 
-    static string FormatPlan(AuthStatus? s)
+    static string FormatPlan(string? orgName, string? subType)
     {
-        if (s is null) return "";
         var parts = new List<string>();
-        if (s.OrgName is { Length: > 0 } org) parts.Add(org);
-        if (s.SubscriptionType is { Length: > 0 } t)
-            parts.Add(t.Replace("_", " "));
+        if (orgName is { Length: > 0 } org) parts.Add(org);
+        if (subType is { Length: > 0 } t) parts.Add(t.Replace("_", " "));
         return parts.Count > 0 ? $" [{string.Join(" · ", parts)}]" : "";
     }
+
+    static string FormatPlan(AuthStatus? s) => FormatPlan(s?.OrgName, s?.SubscriptionType);
 
     // ── menu ───────────────────────────────────────────────────────────────
 
@@ -174,9 +185,13 @@ class TrayContext : ApplicationContext
         // header — use real email from auth status if available
         var realEmail = _authStatus?.Email is { Length: > 0 } e ? e : active?.Email;
         bool activeLimited = realEmail is not null && _rateStore.IsLimited(realEmail);
+        // Per-account stored plan takes priority; fall back to live auth status.
+        var headerPlan = active is { OrgName: not null } or { SubscriptionType: not null }
+            ? FormatPlan(active.OrgName, active.SubscriptionType)
+            : FormatPlan(_authStatus);
 
         var headerText = realEmail is not null
-            ? $"{(activeLimited ? "⚠" : "●")}  {realEmail}{FormatPlan(_authStatus)}"
+            ? $"{(activeLimited ? "⚠" : "●")}  {realEmail}{headerPlan}"
             : "No active account";
         menu.Items.Add(new ToolStripMenuItem(headerText)
         {
@@ -372,6 +387,8 @@ class TrayContext : ApplicationContext
         Thread.Sleep(1500);
         RestartClaude();
         _authStatus = GetAuthStatus();
+        if (_authStatus is not null)
+            _accounts.UpdatePlan(email, _authStatus.OrgName, _authStatus.SubscriptionType);
         Refresh();
     }
 
@@ -383,7 +400,7 @@ class TrayContext : ApplicationContext
             "Save Account");
         if (string.IsNullOrWhiteSpace(email)) return;
 
-        var err = _accounts.AddCurrent(email.Trim());
+        var err = _accounts.AddCurrent(email.Trim(), _authStatus?.OrgName, _authStatus?.SubscriptionType);
         if (err is not null)
         {
             MessageBox.Show(err, "Save Account", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -558,7 +575,7 @@ class AccountStore
     public List<Account> List()
     {
         var files = GetAccountFiles();
-        var result = new List<(string Email, string File)>();
+        var result = new List<(string Email, string File, string? OrgName, string? SubType)>();
 
         foreach (var f in files)
         {
@@ -566,7 +583,11 @@ class AccountStore
             {
                 var node = JsonNode.Parse(File.ReadAllText(f));
                 var email = node?["email"]?.GetValue<string>();
-                if (email is not null) result.Add((email, f));
+                if (email is not null) result.Add((
+                    email, f,
+                    node?["orgName"]?.GetValue<string>(),
+                    node?["subscriptionType"]?.GetValue<string>()
+                ));
             }
             catch { }
         }
@@ -578,7 +599,7 @@ class AccountStore
         var activeEmail = DetectActiveEmail() ?? _activeEmail;
 
         return result
-            .Select((r, i) => new Account(i + 1, r.Email, r.Email == activeEmail))
+            .Select((r, i) => new Account(i + 1, r.Email, r.Email == activeEmail, r.OrgName, r.SubType))
             .ToList();
     }
 
@@ -602,7 +623,7 @@ class AccountStore
     }
 
     // Saves the currently active .credentials.json under the given email.
-    public string? AddCurrent(string email)
+    public string? AddCurrent(string email, string? orgName = null, string? subType = null)
     {
         try
         {
@@ -620,6 +641,8 @@ class AccountStore
                 ["email"] = email,
                 ["credentials"] = JsonNode.Parse(cred.ToJsonString()),
             };
+            if (orgName is not null) obj["orgName"] = orgName;
+            if (subType is not null) obj["subscriptionType"] = subType;
             File.WriteAllText(GetFilePath(email),
                 obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
 
@@ -634,6 +657,21 @@ class AccountStore
         var file = FindFile(email);
         if (file is not null) File.Delete(file);
         if (_activeEmail == email) SaveActiveEmail(null);
+    }
+
+    // Updates the stored org name and subscription type for an existing account.
+    public void UpdatePlan(string email, string? orgName, string? subType)
+    {
+        var file = FindFile(email);
+        if (file is null) return;
+        try
+        {
+            var obj = (JsonNode.Parse(File.ReadAllText(file)) as JsonObject) ?? new JsonObject();
+            if (orgName is not null) obj["orgName"] = orgName;
+            if (subType is not null) obj["subscriptionType"] = subType;
+            File.WriteAllText(file, obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
     }
 
     // ── internals ──────────────────────────────────────────────────────────

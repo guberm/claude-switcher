@@ -80,22 +80,27 @@ class AccountStore:
     # ── public ────────────────────────────────────────────────────────────────
 
     def list(self) -> list[dict]:
-        """Return sorted list of {num, email, active} dicts."""
+        """Return sorted list of {num, email, active, org_name, sub_type} dicts."""
         entries = []
         for f in self._account_files():
             try:
                 data = json.loads(open(f).read())
                 email = data.get("email")
                 if email:
-                    entries.append(email)
+                    entries.append({
+                        "email": email,
+                        "org_name": data.get("orgName"),
+                        "sub_type": data.get("subscriptionType"),
+                    })
             except Exception:
                 pass
-        entries.sort(key=str.lower)
+        entries.sort(key=lambda e: e["email"].lower())
         # Always detect from actual credentials file so display stays accurate
         # even if the user switched accounts outside of this tool.
         active_email = self._detect_active_email() or self._active_email
         return [
-            {"num": i + 1, "email": e, "active": e == active_email}
+            {"num": i + 1, "email": e["email"], "active": e["email"] == active_email,
+             "org_name": e["org_name"], "sub_type": e["sub_type"]}
             for i, e in enumerate(entries)
         ]
 
@@ -115,7 +120,7 @@ class AccountStore:
         except Exception as e:
             return str(e)
 
-    def add_current(self, email: str) -> str | None:
+    def add_current(self, email: str, org_name: str | None = None, sub_type: str | None = None) -> str | None:
         """Save the current .credentials.json as a named account. Returns error or None."""
         try:
             if not os.path.exists(CRED_PATH):
@@ -124,6 +129,8 @@ class AccountStore:
             cred = json.loads(open(CRED_PATH).read())
             os.makedirs(ACCOUNTS_DIR, exist_ok=True)
             obj = {"email": email, "credentials": cred}
+            if org_name: obj["orgName"] = org_name
+            if sub_type: obj["subscriptionType"] = sub_type
             with open(self._file_path(email), "w") as out:
                 json.dump(obj, out, indent=2)
             self._save_active_email(email)
@@ -137,6 +144,20 @@ class AccountStore:
             os.unlink(f)
         if self._active_email == email:
             self._save_active_email(None)
+
+    def update_plan(self, email: str, org_name: str | None, sub_type: str | None):
+        """Update stored orgName/subscriptionType for an existing account."""
+        f = self._find_file(email)
+        if not f:
+            return
+        try:
+            data = json.loads(open(f).read())
+            if org_name: data["orgName"] = org_name
+            if sub_type: data["subscriptionType"] = sub_type
+            with open(f, "w") as out:
+                json.dump(data, out, indent=2)
+        except Exception:
+            pass
 
     # ── internals ─────────────────────────────────────────────────────────────
 
@@ -578,6 +599,8 @@ def do_switch(tray, email: str, auto_restart=False):
     time.sleep(1.5)
     do_restart_claude()
     _auth_status = get_auth_status()
+    if _auth_status:
+        _account_store.update_plan(email, _auth_status.get("orgName"), _auth_status.get("subscriptionType"))
     refresh(tray)
 
 
@@ -589,7 +612,7 @@ def do_add_account(tray):
     if not email:
         return
     email = email.strip()
-    err = _account_store.add_current(email)
+    err = _account_store.add_current(email, (_auth_status or {}).get("orgName"), (_auth_status or {}).get("subscriptionType"))
     if err:
         msgbox("Save Account", err, MB_OK)
         return
@@ -628,7 +651,11 @@ def build_menu(tray, accounts=None):
     real_email = (_auth_status or {}).get("email") or (active["email"] if active else None)
     if real_email:
         limited_hdr = _limits.is_limited(real_email)
-        plan = _format_plan(_auth_status)
+        # Per-account stored plan takes priority; fall back to live auth status.
+        if active and (active.get("org_name") or active.get("sub_type")):
+            plan = _format_plan({"orgName": active["org_name"], "subscriptionType": active["sub_type"]})
+        else:
+            plan = _format_plan(_auth_status)
         header_label = f"{'⚠' if limited_hdr else '●'}  {real_email}{plan}"
     else:
         header_label = "No active account"
@@ -725,6 +752,14 @@ def main():
         while True:
             time.sleep(30)
             _auth_status = get_auth_status()
+            if _tray_icon and _auth_status:
+                active = next((a for a in _accounts if a["active"]), None)
+                if active:
+                    _account_store.update_plan(
+                        active["email"],
+                        _auth_status.get("orgName"),
+                        _auth_status.get("subscriptionType"),
+                    )
             if _tray_icon:
                 refresh(_tray_icon)
     threading.Thread(target=_periodic_refresh, daemon=True).start()
