@@ -9,16 +9,13 @@ No external dependencies — works by directly swapping `~/.claude/.credentials.
 ## Features
 
 - **Tray icon** — Claude's own icon with a colored account badge (turns `!` red when rate limited); rendered at 128px for sharp display on HiDPI screens
-- **Real account info** — reads live email, org, and plan from `claude auth status` every 60 seconds; no stale display after switching
+- **Real account info** — reads live email and org from `claude auth status` every 30 seconds; no stale display after switching
 - **Switch accounts** — click an account; credentials are swapped, Electron profile cache is cleared, and Claude Code restarts automatically
-- **Usage bar** — per-account availability bar filling up as the rate limit window passes:
-  `████████████████████ ✓ available` or `██████░░░░░░░░░░░░░░ ⚠ 3h 42m`
 - **Rate limit tracking** — auto-detected from Claude logs; mark/clear manually via submenu
-- **Auto-switch** — on rate limit, automatically switches to the next available account (toggle in menu)
 - **Add / Remove accounts** — saves/restores the current logged-in session
 - **Restart Claude Code** — kills and relaunches from your home directory; clears Electron's profile cache so account info is always fresh
 - **Single instance** — Windows Mutex prevents duplicate tray processes
-- **Auto-refresh** — re-reads account info from `claude auth status` every 60 seconds
+- **Auto-refresh** — re-reads account info from `claude auth status` every 30 seconds
 
 Two implementations are included:
 
@@ -95,21 +92,23 @@ Repeat for each account. Saved credentials are stored in `~/.claude/accounts/`.
 
 ## Usage
 
-Right-click the tray icon — the menu shows all accounts with usage bars:
+Right-click the tray icon — the menu shows all accounts:
 
 ```
-●  guberm@gmail.com [Michael Guber · enterprise]
+●  guberm@gmail.com [Personal]
 
 ✓  guberm@gmail.com
-   ████████████████████  ✓ available
-
-     michael.guber@trip-arc.com
-   ██████░░░░░░░░░░░░░░  ⚠ 3h 42m
+     michael.guber@trip-arc.com  ⚠ rate limited
 ──────────────────────────────────
-☑  Auto-switch on rate limit
+Save current session as account…
+Remove account ▶
+──────────────────────────────────
+Restart Claude Code
+──────────────────────────────────
+Quit
 ```
 
-The header shows the live email, org, and plan — updated every 60 seconds and immediately after each switch.
+The header shows the live email and org — updated every 30 seconds and immediately after each switch.
 
 Click an account to switch — credentials are swapped and Claude Code restarts automatically.
 
@@ -120,7 +119,6 @@ Default is 5 hours (Claude Pro). Edit `~/.claude/claude-switcher.json`:
 ```json
 {
   "resetHours": 5.0,
-  "autoSwitch": true,
   "rateLimits": {}
 }
 ```
