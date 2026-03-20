@@ -149,8 +149,8 @@ class TrayContext : ApplicationContext
         // Prefer real email from auth status; fall back to stored active account.
         var displayEmail = _authStatus?.Email is { Length: > 0 } e ? e : active?.Email;
         // Use per-account stored plan; fall back to live auth status.
-        var planLabel = active is { OrgName: not null } or { SubType: not null }
-            ? FormatPlan(active.OrgName, active.SubType)
+        var planLabel = active is { OrgName: not null }
+            ? FormatPlan(active.OrgName, null)
             : FormatPlan(_authStatus);
 
         _tray.Text = displayEmail is not null
@@ -160,13 +160,7 @@ class TrayContext : ApplicationContext
     }
 
     static string FormatPlan(string? orgName, string? subType)
-    {
-        var org = orgName is { Length: > 0 } ? orgName : null;
-        var sub = subType is { Length: > 0 } ? subType : null;
-        if (org is null && sub is null) return "";
-        if (org is not null && sub is not null) return $" [{org} · {sub}]";
-        return $" [{org ?? sub}]";
-    }
+        => orgName is { Length: > 0 } ? $" [{orgName}]" : "";
 
     static string FormatPlan(AuthStatus? s) => FormatPlan(s?.OrgName, s?.SubType);
 
@@ -181,8 +175,8 @@ class TrayContext : ApplicationContext
         var realEmail = _authStatus?.Email is { Length: > 0 } e ? e : active?.Email;
         bool activeLimited = realEmail is not null && _rateStore.IsLimited(realEmail);
         // Per-account stored plan takes priority; fall back to live auth status.
-        var headerPlan = active is { OrgName: not null } or { SubType: not null }
-            ? FormatPlan(active.OrgName, active.SubType)
+        var headerPlan = active is { OrgName: not null }
+            ? FormatPlan(active.OrgName, null)
             : FormatPlan(_authStatus);
 
         var headerText = realEmail is not null
@@ -200,10 +194,10 @@ class TrayContext : ApplicationContext
         // account list
         foreach (var acc in accounts)
         {
-            bool limited = _rateStore.IsLimited(acc.Email);
             string prefix = acc.Active ? "✓  " : "     ";
-            var mi = new ToolStripMenuItem(prefix + acc.Email);
-            if (limited) mi.ForeColor = Color.OrangeRed;
+            var label = prefix + acc.Email;
+            if (_rateStore.IsLimited(acc.Email)) label += "  ⚠";
+            var mi = new ToolStripMenuItem(label);
             if (acc.Active)
             {
                 mi.Enabled = false;
@@ -213,15 +207,6 @@ class TrayContext : ApplicationContext
                 var email = acc.Email;
                 mi.Click += (_, _) => DoSwitch(email);
             }
-
-            var markItem = new ToolStripMenuItem("Mark as rate limited") { Enabled = !limited };
-            markItem.Click += (_, _) => { _rateStore.MarkLimited(acc.Email); Refresh(); };
-            var clearItem = new ToolStripMenuItem(limited
-                ? $"Clear  (limited since {_rateStore.LimitedAt(acc.Email):HH:mm})"
-                : "Clear rate limit") { Enabled = limited };
-            clearItem.Click += (_, _) => { _rateStore.ClearLimit(acc.Email); Refresh(); };
-            mi.DropDownItems.Add(markItem);
-            mi.DropDownItems.Add(clearItem);
             menu.Items.Add(mi);
         }
 
@@ -243,6 +228,18 @@ class TrayContext : ApplicationContext
                 removeMenu.DropDownItems.Add(ri);
             }
             menu.Items.Add(removeMenu);
+        }
+
+        // show "Clear rate limits" only when at least one account is limited
+        if (accounts.Any(a => _rateStore.IsLimited(a.Email)))
+        {
+            var clearAll = new ToolStripMenuItem("Clear rate limits");
+            clearAll.Click += (_, _) =>
+            {
+                foreach (var a in accounts) _rateStore.ClearLimit(a.Email);
+                Refresh();
+            };
+            menu.Items.Add(clearAll);
         }
 
         menu.Items.Add(new ToolStripSeparator());

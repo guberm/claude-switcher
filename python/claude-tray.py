@@ -366,11 +366,7 @@ def get_auth_status() -> dict | None:
 
 def _format_plan(status: dict | None) -> str:
     org = (status.get("orgName") or "").strip() if status else ""
-    sub = (status.get("subscriptionType") or "").strip() if status else ""
-    if org and sub: return f" [{org} · {sub}]"
-    if org: return f" [{org}]"
-    if sub: return f" [{sub}]"
-    return ""
+    return f" [{org}]" if org else ""
 
 
 def clear_electron_profile_cache():
@@ -595,11 +591,7 @@ def build_menu(tray, accounts=None):
     real_email = (_auth_status or {}).get("email") or (active["email"] if active else None)
     if real_email:
         limited_hdr = _limits.is_limited(real_email)
-        # Per-account stored plan takes priority; fall back to live auth status.
-        if active and (active.get("org_name") or active.get("sub_type")):
-            plan = _format_plan({"orgName": active["org_name"], "subscriptionType": active["sub_type"]})
-        else:
-            plan = _format_plan(_auth_status)
+        plan = _format_plan(_auth_status)
         header_label = f"{'⚠' if limited_hdr else '●'}  {real_email}{plan}"
     else:
         header_label = "No active account"
@@ -608,41 +600,27 @@ def build_menu(tray, accounts=None):
 
     # accounts
     for acc in accounts:
-        limited = _limits.is_limited(acc["email"])
         prefix = "✓  " if acc["active"] else "     "
+        label = prefix + acc["email"]
+        if _limits.is_limited(acc["email"]): label += "  ⚠"
 
         if acc["active"]:
-            rows.append(item(prefix + acc["email"], None, enabled=False))
+            rows.append(item(label, None, enabled=False))
         else:
             def make_switch(email):
                 return lambda i, _: do_switch(i, email)
-            rows.append(item(prefix + acc["email"], make_switch(acc["email"])))
+            rows.append(item(label, make_switch(acc["email"])))
 
     rows.append(Menu.SEPARATOR)
 
-    # rate limit mark/clear per account
-    if accounts:
-        limit_items = []
-        for acc in accounts:
-            email = acc["email"]
-            limited = _limits.is_limited(email)
-            since = _limits.limited_since_str(email)
-            clear_label = f"Clear (since {since})" if since else "Clear"
-
-            def make_mark(e):
-                return lambda i, _: [_limits.mark_limited(e), refresh(i)]
-
-            def make_clear(e):
-                return lambda i, _: [_limits.clear_limit(e), refresh(i)]
-
-            sub = [
-                item("Mark as limited", make_mark(email), enabled=not limited),
-                item(clear_label, make_clear(email), enabled=limited),
-            ]
-            limit_items.append(item(email, Menu(*sub)))
-        rows.append(item("Rate limits ▶", Menu(*limit_items)))
-
-    rows.append(Menu.SEPARATOR)
+    # show "Clear rate limits" only when at least one account is limited
+    any_limited = any(_limits.is_limited(a["email"]) for a in accounts)
+    if any_limited:
+        def clear_all(tray, _):
+            for a in accounts: _limits.clear_limit(a["email"])
+            refresh(tray)
+        rows.append(item("Clear rate limits", clear_all))
+        rows.append(Menu.SEPARATOR)
     rows.append(item("Save current session as account…", lambda i, _: do_add_account(i)))
 
     if accounts:
