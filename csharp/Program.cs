@@ -196,7 +196,6 @@ class TrayContext : ApplicationContext
         {
             string prefix = acc.Active ? "✓  " : "     ";
             var label = prefix + acc.Email;
-            if (_rateStore.IsLimited(acc.Email)) label += "  ⚠";
             var mi = new ToolStripMenuItem(label);
             if (acc.Active)
             {
@@ -275,9 +274,18 @@ class TrayContext : ApplicationContext
             $"Switched to {email}.\nRestarting Claude Code…", ToolTipIcon.Info);
         Thread.Sleep(1500);
         RestartClaude();
-        _authStatus = GetAuthStatus();
-        if (_authStatus is not null)
+        // Validate that GetAuthStatus() actually reflects the new account.
+        // The VS Code proxy (localhost:45918) can return stale data right after restart.
+        var newStatus = GetAuthStatus();
+        if (newStatus?.Email == email)
+        {
+            _authStatus = newStatus;
             _accounts.UpdatePlan(email, _authStatus.OrgName, _authStatus.SubType);
+        }
+        else
+        {
+            _authStatus = null; // Let Refresh() use file-based DetectActiveEmail() instead
+        }
         Refresh();
     }
 
@@ -369,10 +377,10 @@ class TrayContext : ApplicationContext
     {
         const int size = 128;
         var base_ = TryLoadClaudeIcon();
-        var badgeColor = limited ? Color.OrangeRed
-            : active is not null ? ParseHex(Palette[(active.Num - 1) % Palette.Length])
+        var badgeColor = active is not null
+            ? ParseHex(Palette[(active.Num - 1) % Palette.Length])
             : Color.FromArgb(0x66, 0x66, 0x66);
-        var badgeLetter = limited ? "!" : active is not null ? active.Email[0].ToString().ToUpper() : "C";
+        var badgeLetter = active is not null ? active.Email[0].ToString().ToUpper() : "C";
 
         if (base_ is null) return MakeLetterIcon(badgeLetter, badgeColor, size);
         if (active is null) return base_;

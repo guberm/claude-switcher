@@ -453,12 +453,11 @@ def build_tray_image(active, limited: bool, size=128) -> Image.Image:
     if _claude_base is None:
         _claude_base = get_claude_base_icon(size)
 
-    badge_color = "#E8754A" if limited else (
-        COLORS[(active["num"] - 1) % len(COLORS)] if active else "#888888")
-    badge_letter = "!" if limited else (active["email"][0].upper() if active else "C")
+    badge_color = COLORS[(active["num"] - 1) % len(COLORS)] if active else "#888888"
+    badge_letter = active["email"][0].upper() if active else "C"
 
     if _claude_base is not None:
-        if active or limited:
+        if active:
             return overlay_badge(_claude_base, badge_letter, badge_color, size)
         return _claude_base.copy()
 
@@ -538,9 +537,14 @@ def do_switch(tray, email: str):
     tray.notify(f"Switched to {email}.\nRestarting Claude Code…", "Switched")
     time.sleep(1.5)
     do_restart_claude()
-    _auth_status = get_auth_status()
-    if _auth_status:
+    # Validate that get_auth_status() actually reflects the new account.
+    # The VS Code proxy (localhost:45918) can return stale data right after restart.
+    new_status = get_auth_status()
+    if new_status and new_status.get("email") == email:
+        _auth_status = new_status
         _account_store.update_plan(email, _auth_status.get("orgName"), _auth_status.get("subscriptionType"))
+    else:
+        _auth_status = None  # Let refresh() use file-based detection instead
     refresh(tray)
 
 
@@ -602,7 +606,6 @@ def build_menu(tray, accounts=None):
     for acc in accounts:
         prefix = "✓  " if acc["active"] else "     "
         label = prefix + acc["email"]
-        if _limits.is_limited(acc["email"]): label += "  ⚠"
 
         if acc["active"]:
             rows.append(item(label, None, enabled=False))
