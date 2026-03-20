@@ -114,12 +114,6 @@ class TrayContext : ApplicationContext
         _rateStore.MarkLimited(active.Email);
         Refresh();
 
-        if (_rateStore.AutoSwitch)
-        {
-            var next = accounts.FirstOrDefault(a => !a.Active && !_rateStore.IsLimited(a.Email));
-            if (next is not null) { DoSwitch(next.Email, autoRestart: true); return; }
-        }
-
         _tray.ShowBalloonTip(5000, "Rate limit hit",
             $"{active.Email} is rate limited.\nSwitch accounts from the tray.", ToolTipIcon.Warning);
     }
@@ -216,7 +210,7 @@ class TrayContext : ApplicationContext
             else
             {
                 var email = acc.Email;
-                mi.Click += (_, _) => DoSwitch(email, autoRestart: true);
+                mi.Click += (_, _) => DoSwitch(email);
             }
 
             var markItem = new ToolStripMenuItem("Mark as rate limited") { Enabled = !limited };
@@ -228,33 +222,7 @@ class TrayContext : ApplicationContext
             mi.DropDownItems.Add(markItem);
             mi.DropDownItems.Add(clearItem);
             menu.Items.Add(mi);
-            menu.Items.Add(MakeBarItem(acc.Email, limited));
-
-            if (limited)
-            {
-                var email2 = acc.Email;
-                var since = _rateStore.LimitedAt(acc.Email);
-                var clearBtn = new ToolStripMenuItem(
-                    $"     ✕  Clear  (marked {since:HH:mm})")
-                {
-                    ForeColor = Color.Gray,
-                    Font = new Font("Segoe UI", 8f),
-                };
-                clearBtn.Click += (_, _) => { _rateStore.ClearLimit(email2); Refresh(); };
-                menu.Items.Add(clearBtn);
-            }
         }
-
-        menu.Items.Add(new ToolStripSeparator());
-
-        // auto-switch toggle
-        var autoSwitch = new ToolStripMenuItem("Auto-switch on rate limit")
-        {
-            Checked = _rateStore.AutoSwitch,
-            CheckOnClick = true,
-        };
-        autoSwitch.CheckedChanged += (_, _) => { _rateStore.AutoSwitch = autoSwitch.Checked; };
-        menu.Items.Add(autoSwitch);
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -291,86 +259,9 @@ class TrayContext : ApplicationContext
         return menu;
     }
 
-    // ── usage bar ──────────────────────────────────────────────────────────
-
-    ToolStripItem MakeBarItem(string email, bool limited)
-    {
-        const int total = 20;
-        int filled;
-        string statusText;
-        Color fillColor;
-
-        if (!limited)
-        {
-            filled = total;
-            statusText = "  ✓ available";
-            fillColor = Color.SeaGreen;
-        }
-        else
-        {
-            var since = _rateStore.LimitedAt(email);
-            if (!since.HasValue)
-            {
-                filled = 0;
-                statusText = "  ⚠ limited";
-                fillColor = Color.OrangeRed;
-            }
-            else
-            {
-                var window = TimeSpan.FromHours(_rateStore.ResetHours);
-                var elapsed = DateTime.Now - since.Value;
-                if (elapsed > window) elapsed = window;
-                filled = Math.Clamp((int)(elapsed.TotalSeconds / window.TotalSeconds * total), 0, total);
-                statusText = $"  ⚠ {FormatRemaining(email)}";
-                fillColor = Color.OrangeRed;
-            }
-        }
-
-        var font = new Font("Consolas", 8f);
-        var emptyColor = Color.FromArgb(210, 210, 210);
-
-        var panel = new FlowLayoutPanel
-        {
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            AutoSize = true,
-            BackColor = SystemColors.Menu,
-            Padding = Padding.Empty,
-            Margin = Padding.Empty,
-        };
-
-        void AddLbl(string text, Color color) => panel.Controls.Add(new Label
-        {
-            Text = text,
-            Font = font,
-            ForeColor = color,
-            AutoSize = true,
-            Padding = Padding.Empty,
-            Margin = Padding.Empty,
-            BackColor = SystemColors.Menu,
-        });
-
-        if (filled > 0) AddLbl(new string('█', filled), fillColor);
-        if (filled < total) AddLbl(new string('█', total - filled), emptyColor);
-        AddLbl(statusText, fillColor);
-
-        return new ToolStripControlHost(panel) { Margin = new Padding(28, 0, 4, 3) };
-    }
-
-    string FormatRemaining(string email)
-    {
-        var since = _rateStore.LimitedAt(email);
-        if (!since.HasValue) return "";
-        var rem = TimeSpan.FromHours(_rateStore.ResetHours) - (DateTime.Now - since.Value);
-        if (rem <= TimeSpan.Zero) return "resets soon";
-        return rem.TotalHours >= 1
-            ? $"{(int)rem.TotalHours}h {rem.Minutes:D2}m"
-            : $"{(int)rem.TotalMinutes}m";
-    }
-
     // ── actions ────────────────────────────────────────────────────────────
 
-    void DoSwitch(string email, bool autoRestart = false)
+    void DoSwitch(string email)
     {
         var err = _accounts.SwitchTo(email);
         if (err is not null)
@@ -764,13 +655,9 @@ class RateLimitStore
         ".claude", "claude-switcher.json");
 
     private Dictionary<string, DateTime> _limits = new();
-    private bool _autoSwitch = true;
     private double _resetHours = 5.0;
 
     public RateLimitStore() => Load();
-
-    public bool AutoSwitch   { get => _autoSwitch;  set { _autoSwitch = value;  Save(); } }
-    public double ResetHours { get => _resetHours;  set { _resetHours = value;  Save(); } }
 
     public bool IsLimited(string email) => _limits.ContainsKey(email);
     public DateTime? LimitedAt(string email) => _limits.TryGetValue(email, out var t) ? t : null;
@@ -789,7 +676,6 @@ class RateLimitStore
             if (!File.Exists(Path_)) return;
             var node = JsonNode.Parse(File.ReadAllText(Path_));
             if (node is null) return;
-            _autoSwitch = node["autoSwitch"]?.GetValue<bool>() ?? true;
             _resetHours = node["resetHours"]?.GetValue<double>() ?? 5.0;
             var lim = node["rateLimits"]?.AsObject();
             if (lim is not null)
@@ -807,7 +693,6 @@ class RateLimitStore
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path_)!);
             var obj = new JsonObject
             {
-                ["autoSwitch"] = _autoSwitch,
                 ["resetHours"] = _resetHours,
                 ["rateLimits"] = new JsonObject(
                     _limits.Select(kv =>

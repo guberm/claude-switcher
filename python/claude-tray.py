@@ -25,7 +25,6 @@ from pystray import Menu, MenuItem as item
 
 COLORS = ["#4A90D9", "#E8754A", "#5CB85C", "#9B59B6", "#F39C12", "#E74C3C"]
 CLAUDE_EXE = os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe")
-BAR_TOTAL = 20
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR     = os.path.join(HOME, ".claude")
@@ -227,18 +226,8 @@ class AccountStore:
 class RateLimitStore:
     def __init__(self):
         self._limits: dict[str, str] = {}
-        self._auto_switch = True
         self._reset_hours = 5.0
         self._load()
-
-    @property
-    def auto_switch(self):
-        return self._auto_switch
-
-    @auto_switch.setter
-    def auto_switch(self, value):
-        self._auto_switch = value
-        self._save()
 
     @property
     def reset_hours(self):
@@ -270,18 +259,6 @@ class RateLimitStore:
         dt = self.limited_at(email)
         return dt.strftime("%H:%M") if dt else None
 
-    def format_remaining(self, email: str) -> str:
-        since = self.limited_at(email)
-        if not since:
-            return ""
-        rem = timedelta(hours=self._reset_hours) - (datetime.now() - since)
-        if rem.total_seconds() <= 0:
-            return "resets soon"
-        total_min = int(rem.total_seconds() / 60)
-        if total_min >= 60:
-            return f"{total_min // 60}h {total_min % 60:02d}m"
-        return f"{total_min}m"
-
     def mark_limited(self, email: str):
         self._limits[email] = datetime.now().isoformat()
         self._save()
@@ -293,7 +270,6 @@ class RateLimitStore:
     def _load(self):
         try:
             data = json.loads(open(SWITCHER_PATH).read())
-            self._auto_switch = data.get("autoSwitch", True)
             self._reset_hours = data.get("resetHours", 5.0)
             self._limits = data.get("rateLimits", {})
         except Exception:
@@ -305,7 +281,6 @@ class RateLimitStore:
                 data = json.loads(open(SWITCHER_PATH).read())
             except Exception:
                 data = {}
-            data["autoSwitch"] = self._auto_switch
             data["resetHours"] = self._reset_hours
             data["rateLimits"] = self._limits
             os.makedirs(os.path.dirname(SWITCHER_PATH), exist_ok=True)
@@ -421,22 +396,6 @@ def clear_electron_profile_cache():
 
 def hex_to_rgb(h):
     return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
-
-
-def build_bar(email: str, limited: bool) -> str:
-    if not limited:
-        return "  " + "█" * BAR_TOTAL + "  ✓ available"
-    since = _limits.limited_at(email)
-    if not since:
-        return "  " + "░" * BAR_TOTAL + "  ⚠ limited"
-    window = timedelta(hours=_limits.reset_hours)
-    elapsed = datetime.now() - since
-    if elapsed > window:
-        elapsed = window
-    filled = int(elapsed.total_seconds() / window.total_seconds() * BAR_TOTAL)
-    filled = max(0, min(BAR_TOTAL, filled))
-    bar = "█" * filled + "▒" * (BAR_TOTAL - filled)
-    return "  " + bar + f"  ⚠ {_limits.format_remaining(email)}"
 
 
 # ── icon building ─────────────────────────────────────────────────────────────
@@ -571,13 +530,6 @@ def on_rate_limit_detected():
     _limits.mark_limited(active["email"])
     _update_ui(_tray_icon, accounts)
 
-    if _limits.auto_switch:
-        nxt = next((a for a in accounts
-                    if not a["active"] and not _limits.is_limited(a["email"])), None)
-        if nxt:
-            do_switch(_tray_icon, nxt["email"], auto_restart=True)
-            return
-
     _tray_icon.notify(
         f"{active['email']} hit its limit.\nSwitch accounts from the tray.",
         "Rate limit detected")
@@ -585,7 +537,7 @@ def on_rate_limit_detected():
 
 # ── actions ───────────────────────────────────────────────────────────────────
 
-def do_switch(tray, email: str, auto_restart=False):
+def do_switch(tray, email: str):
     global _accounts, _auth_status
     err = _account_store.switch_to(email)
     if err:
@@ -662,7 +614,7 @@ def build_menu(tray, accounts=None):
     rows.append(item(header_label, None, enabled=False))
     rows.append(Menu.SEPARATOR)
 
-    # accounts + bars
+    # accounts
     for acc in accounts:
         limited = _limits.is_limited(acc["email"])
         prefix = "✓  " if acc["active"] else "     "
@@ -673,8 +625,6 @@ def build_menu(tray, accounts=None):
             def make_switch(email):
                 return lambda i, _: do_switch(i, email)
             rows.append(item(prefix + acc["email"], make_switch(acc["email"])))
-
-        rows.append(item(build_bar(acc["email"], limited), None, enabled=False))
 
     rows.append(Menu.SEPARATOR)
 
@@ -699,14 +649,6 @@ def build_menu(tray, accounts=None):
             ]
             limit_items.append(item(email, Menu(*sub)))
         rows.append(item("Rate limits ▶", Menu(*limit_items)))
-
-    # auto-switch toggle
-    def toggle_auto_switch(i, _):
-        _limits.auto_switch = not _limits.auto_switch
-        refresh(i)
-
-    auto_label = ("✓  " if _limits.auto_switch else "     ") + "Auto-switch on rate limit"
-    rows.append(item(auto_label, toggle_auto_switch))
 
     rows.append(Menu.SEPARATOR)
     rows.append(item("Save current session as account…", lambda i, _: do_add_account(i)))
