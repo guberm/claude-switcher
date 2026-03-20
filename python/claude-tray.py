@@ -719,11 +719,11 @@ def main():
     watcher = LogWatcher(on_rate_limit_detected)
     watcher.start()
 
-    # Refresh auth status and account list every 60 seconds
+    # Refresh auth status and account list every 30 seconds
     def _periodic_refresh():
         global _auth_status
         while True:
-            time.sleep(60)
+            time.sleep(30)
             _auth_status = get_auth_status()
             if _tray_icon:
                 refresh(_tray_icon)

@@ -45,7 +45,7 @@ class TrayContext : ApplicationContext
         _watcher = new LogWatcher(OnRateLimitDetected);
         _watcher.Start();
 
-        _refreshTimer = new System.Windows.Forms.Timer { Interval = 60_000 };
+        _refreshTimer = new System.Windows.Forms.Timer { Interval = 30_000 };
         _refreshTimer.Tick += (_, _) => { _authStatus = GetAuthStatus(); Refresh(); };
         _refreshTimer.Start();
 
