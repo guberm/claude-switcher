@@ -180,13 +180,12 @@ class TrayContext : ApplicationContext
             : FormatPlan(_authStatus);
 
         var headerText = realEmail is not null
-            ? $"{(activeLimited ? "⚠" : "●")}  {realEmail}{headerPlan}"
+            ? $"●  {realEmail}{headerPlan}"
             : "No active account";
         menu.Items.Add(new ToolStripMenuItem(headerText)
         {
             Enabled = false,
             Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            ForeColor = activeLimited ? Color.OrangeRed : SystemColors.ControlText,
         });
 
         menu.Items.Add(new ToolStripSeparator());

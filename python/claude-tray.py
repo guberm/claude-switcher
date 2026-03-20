@@ -596,7 +596,7 @@ def build_menu(tray, accounts=None):
     if real_email:
         limited_hdr = _limits.is_limited(real_email)
         plan = _format_plan(_auth_status)
-        header_label = f"{'⚠' if limited_hdr else '●'}  {real_email}{plan}"
+        header_label = f"●  {real_email}{plan}"
     else:
         header_label = "No active account"
     rows.append(item(header_label, None, enabled=False))
