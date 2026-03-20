@@ -414,7 +414,7 @@ def build_bar(email: str, limited: bool) -> str:
         elapsed = window
     filled = int(elapsed.total_seconds() / window.total_seconds() * BAR_TOTAL)
     filled = max(0, min(BAR_TOTAL, filled))
-    bar = "█" * filled + "░" * (BAR_TOTAL - filled)
+    bar = "█" * filled + "▒" * (BAR_TOTAL - filled)
     return "  " + bar + f"  ⚠ {_limits.format_remaining(email)}"
 
 

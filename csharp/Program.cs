@@ -312,7 +312,7 @@ class TrayContext : ApplicationContext
         }
 
         var font = new Font("Consolas", 8f);
-        var emptyColor = Color.FromArgb(160, 160, 160);
+        var emptyColor = Color.FromArgb(210, 210, 210);
 
         var panel = new FlowLayoutPanel
         {
@@ -336,7 +336,7 @@ class TrayContext : ApplicationContext
         });
 
         if (filled > 0) AddLbl(new string('█', filled), fillColor);
-        if (filled < total) AddLbl(new string('░', total - filled), emptyColor);
+        if (filled < total) AddLbl(new string('█', total - filled), emptyColor);
         AddLbl(statusText, fillColor);
 
         return new ToolStripControlHost(panel) { Margin = new Padding(28, 0, 4, 3) };
