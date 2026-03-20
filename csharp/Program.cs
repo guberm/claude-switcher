@@ -120,8 +120,16 @@ class TrayContext : ApplicationContext
         foreach (var acc in accounts)
             if (_store.IsExpired(acc.Email)) _store.ClearLimit(acc.Email);
 
-        _tray.Icon?.Dispose();
-        _tray.Icon = BuildTrayIcon(active, limited);
+        // swap icon — set new first, dispose old after to avoid blank tray
+        var oldIcon = _tray.Icon;
+        var newIcon = BuildTrayIcon(active, limited);
+        _tray.Icon = newIcon;
+        oldIcon?.Dispose();
+
+        // force Windows to repaint the tray area
+        _tray.Visible = false;
+        _tray.Visible = true;
+
         _tray.Text = active is not null
             ? $"Claude: {active.Email}{(limited ? " ⚠ rate limited" : "")}"
             : "Claude Account Switcher";
@@ -296,6 +304,7 @@ class TrayContext : ApplicationContext
     void SwitchTo(int num, string email, bool autoRestart = false)
     {
         RunCmd("cswap", $"--switch-to {num}");
+        Thread.Sleep(400); // give cswap time to write credential store
         Refresh();
         if (autoRestart)
         {
