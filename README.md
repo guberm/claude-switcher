@@ -13,6 +13,9 @@ Built on top of [claude-swap](https://github.com/denysvitali/claude-swap).
 - **Add account** — guided flow: log in via `claude /login`, then confirm
 - **Remove account** — submenu with confirmation dialog
 - **Restart Claude Code** — kills and relaunches from your home directory
+- **Rate limit tracking** — mark accounts as limited (⚠), with timestamp; auto-detected from Claude logs
+- **Auto-switch** — when a rate limit is detected, automatically switches to the next available account and restarts Claude Code (toggle on/off from menu)
+- **Single instance** — only one copy runs at a time (Windows Mutex)
 
 Two implementations are included:
 
