@@ -2,18 +2,19 @@
 
 A system tray utility for switching between multiple [Claude Code](https://claude.ai/code) accounts without logging out.
 
-Built on top of [claude-swap](https://github.com/denysvitali/claude-swap).
+No external dependencies — works by directly swapping `~/.claude/.credentials.json`.
 
 ---
 
 ## Features
 
 - **Tray icon** — Claude's own icon with a colored account badge (turns `!` red when rate limited)
-- **Switch accounts** — click an account in the menu; tray updates instantly
-- **Usage bar** — per-account availability bar: `████████████████████ ✓ available` or `██████░░░░░░░░░░░░░░ ⚠ 3h 42m`
+- **Switch accounts** — click an account; credentials are swapped and Claude Code restarts automatically
+- **Usage bar** — per-account availability bar filling up as the rate limit window passes:
+  `████████████████████ ✓ available` or `██████░░░░░░░░░░░░░░ ⚠ 3h 42m`
 - **Rate limit tracking** — auto-detected from Claude logs; mark/clear manually via submenu
-- **Auto-switch** — on rate limit, automatically switches to the next available account and restarts Claude Code (toggle in menu)
-- **Add / Remove account** — guided flows with confirmation dialogs
+- **Auto-switch** — on rate limit, automatically switches to the next available account (toggle in menu)
+- **Add / Remove accounts** — saves/restores the current logged-in session
 - **Restart Claude Code** — kills and relaunches from your home directory
 - **Single instance** — Windows Mutex prevents duplicate tray processes
 
@@ -28,11 +29,8 @@ Two implementations are included:
 
 ## Prerequisites
 
-- [Claude Code](https://claude.ai/code) installed
-- [claude-swap](https://github.com/denysvitali/claude-swap) installed:
-  ```powershell
-  uv tool install claude-swap
-  ```
+- [Claude Code](https://claude.ai/code) installed (provides `~/.claude/.credentials.json`)
+- No other tools required
 
 ---
 
@@ -69,7 +67,7 @@ $lnk.Save()
 Requires [uv](https://github.com/astral-sh/uv):
 
 ```powershell
-# via batch file (no console window with the included .vbs launcher)
+# via .vbs launcher (no console window)
 python\claude-tray.vbs
 
 # or directly
@@ -78,28 +76,38 @@ uv run --with pystray --with pillow python\claude-tray.py
 
 ---
 
+## First-time setup
+
+You need to save each account once before switching.
+
+**For each account:**
+
+1. Log into that account in Claude Code (`claude /logout` → `claude /login` if needed)
+2. Launch ClaudeTray (or if already running, right-click the tray icon)
+3. Right-click → **Save current session as account…**
+4. Enter the email address for this account
+
+Repeat for each account. Saved credentials are stored in `~/.claude/accounts/`.
+
+---
+
 ## Usage
 
-1. Launch `ClaudeTray.exe` (or the Python equivalent)
-2. Right-click the tray icon — the menu shows all accounts with usage bars:
-   ```
-   ●  michael.guber@trip-arc.com
+Right-click the tray icon — the menu shows all accounts with usage bars:
 
-   ✓  michael.guber@trip-arc.com
-      ████████████████████  ✓ available
+```
+●  michael.guber@trip-arc.com
 
-        guberm@gmail.com
-      ██████░░░░░░░░░░░░░░  ⚠ 3h 42m
-   ──────────────────────────────────
-   ☑  Auto-switch on rate limit
-   ```
-3. Click an account to switch; the tray icon badge updates immediately
-4. Use **Restart Claude Code** or restart manually to apply the switch
+✓  michael.guber@trip-arc.com
+   ████████████████████  ✓ available
 
-### Adding a second account
+     guberm@gmail.com
+   ██████░░░░░░░░░░░░░░  ⚠ 3h 42m
+──────────────────────────────────
+☑  Auto-switch on rate limit
+```
 
-1. In Claude Code: `claude /logout` → `claude /login` (log in with the new account)
-2. Right-click tray → **Add account…** → click OK
+Click an account to switch — credentials are swapped and Claude Code restarts automatically.
 
 ### Configuring the rate-limit reset window
 
@@ -117,7 +125,8 @@ Default is 5 hours (Claude Pro). Edit `~/.claude/claude-switcher.json`:
 
 ## How it works
 
-`claude-swap` stores Claude Code session tokens per account in the Windows credential store (via `keyring`). Switching swaps the active token file that Claude Code reads on startup.
+Each saved account's `~/.claude/.credentials.json` is stored in `~/.claude/accounts/<email>.json`.
+When you switch, ClaudeTray copies the chosen account's credentials to `.credentials.json` and restarts Claude Code. On startup, the active account is identified by matching the `refreshToken` in the live credentials file.
 
 ---
 

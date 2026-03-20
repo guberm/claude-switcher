@@ -19,23 +19,20 @@ Application.EnableVisualStyles();
 Application.SetCompatibleTextRenderingDefault(false);
 Application.Run(new TrayContext());
 
+record Account(int Num, string Email, bool Active);
+
 // ══════════════════════════════════════════════════════════════════════════════
 
 class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon _tray;
-    private readonly RateLimitStore _store = new();
+    private readonly AccountStore _accounts = new();
+    private readonly RateLimitStore _rateStore = new();
     private readonly LogWatcher _watcher;
-    private List<Account> _accounts = new();  // cached list
+    private List<Account> _cached = [];
 
     private static readonly string[] Palette =
         ["#4A90D9", "#E8754A", "#5CB85C", "#9B59B6", "#F39C12", "#E74C3C"];
-
-    private static readonly string ClaudeExe = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".local", "bin", "claude.exe");
-
-    record Account(int Num, string Email, bool Active);
 
     // ── bootstrap ──────────────────────────────────────────────────────────
 
@@ -47,7 +44,7 @@ class TrayContext : ApplicationContext
         Refresh();
     }
 
-    // ── rate limit callback (background thread) ────────────────────────────
+    // ── rate limit callback ────────────────────────────────────────────────
 
     void OnRateLimitDetected()
     {
@@ -59,80 +56,44 @@ class TrayContext : ApplicationContext
 
     void HandleRateLimit()
     {
-        var accounts = ParseAccounts();
+        var accounts = _accounts.List();
         var active = accounts.FirstOrDefault(a => a.Active);
-        if (active is null || _store.IsLimited(active.Email)) return;
+        if (active is null || _rateStore.IsLimited(active.Email)) return;
 
-        _store.MarkLimited(active.Email);
+        _rateStore.MarkLimited(active.Email);
         Refresh();
 
-        if (_store.AutoSwitch)
+        if (_rateStore.AutoSwitch)
         {
-            var next = accounts.FirstOrDefault(a => !a.Active && !_store.IsLimited(a.Email));
-            if (next is not null) { SwitchTo(next.Num, next.Email, autoRestart: true); return; }
+            var next = accounts.FirstOrDefault(a => !a.Active && !_rateStore.IsLimited(a.Email));
+            if (next is not null) { DoSwitch(next.Email, autoRestart: true); return; }
         }
 
         _tray.ShowBalloonTip(5000, "Rate limit hit",
             $"{active.Email} is rate limited.\nSwitch accounts from the tray.", ToolTipIcon.Warning);
     }
 
-    // ── cswap ──────────────────────────────────────────────────────────────
-
-    static string RunCmd(string exe, string args)
-    {
-        using var p = Process.Start(new ProcessStartInfo(exe, args)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        })!;
-        var text = p.StandardOutput.ReadToEnd();
-        p.WaitForExit();
-        return text;
-    }
-
-    List<Account> ParseAccounts()
-    {
-        var result = new List<Account>();
-        try
-        {
-            foreach (var line in RunCmd("cswap", "--list").Split('\n'))
-            {
-                var m = Regex.Match(line.Trim(), @"^(\d+):\s+(.+?)(\s+\(active\))?\s*$");
-                if (m.Success)
-                    result.Add(new(int.Parse(m.Groups[1].Value),
-                        m.Groups[2].Value.Trim(), m.Groups[3].Success));
-            }
-        }
-        catch { }
-        return result;
-    }
-
     // ── refresh ────────────────────────────────────────────────────────────
 
     void Refresh()
     {
-        _accounts = ParseAccounts();
-        UpdateUI(_accounts);
+        _cached = _accounts.List();
+        UpdateUI(_cached);
     }
 
     void UpdateUI(List<Account> accounts)
     {
         var active = accounts.FirstOrDefault(a => a.Active);
-        bool limited = active is not null && _store.IsLimited(active.Email);
+        bool limited = active is not null && _rateStore.IsLimited(active.Email);
 
-        // auto-clear expired limits
         foreach (var acc in accounts)
-            if (_store.IsExpired(acc.Email)) _store.ClearLimit(acc.Email);
+            if (_rateStore.IsExpired(acc.Email)) _rateStore.ClearLimit(acc.Email);
 
-        // swap icon — set new first, dispose old after to avoid blank tray
         var oldIcon = _tray.Icon;
         var newIcon = BuildTrayIcon(active, limited);
         _tray.Icon = newIcon;
         oldIcon?.Dispose();
 
-        // force Windows to repaint the tray area
         _tray.Visible = false;
         _tray.Visible = true;
 
@@ -149,8 +110,8 @@ class TrayContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Font = new Font("Segoe UI", 9f);
 
-        // ── header ──
-        bool activeLimited = active is not null && _store.IsLimited(active.Email);
+        // header
+        bool activeLimited = active is not null && _rateStore.IsLimited(active.Email);
         menu.Items.Add(new ToolStripMenuItem(
             active is not null
                 ? $"{(activeLimited ? "⚠" : "●")}  {active.Email}"
@@ -163,12 +124,10 @@ class TrayContext : ApplicationContext
 
         menu.Items.Add(new ToolStripSeparator());
 
-        // ── account list with per-account usage bar ──
+        // account list
         foreach (var acc in accounts)
         {
-            bool limited = _store.IsLimited(acc.Email);
-
-            // account row
+            bool limited = _rateStore.IsLimited(acc.Email);
             string prefix = acc.Active ? "✓  " : "     ";
             var mi = new ToolStripMenuItem(prefix + acc.Email);
             if (limited) mi.ForeColor = Color.OrangeRed;
@@ -178,40 +137,37 @@ class TrayContext : ApplicationContext
             }
             else
             {
-                var num = acc.Num; var email = acc.Email;
-                mi.Click += (_, _) => SwitchTo(num, email);
+                var email = acc.Email;
+                mi.Click += (_, _) => DoSwitch(email, autoRestart: true);
             }
 
-            // right-click: mark / clear
             var markItem = new ToolStripMenuItem("Mark as rate limited") { Enabled = !limited };
-            markItem.Click += (_, _) => { _store.MarkLimited(acc.Email); Refresh(); };
+            markItem.Click += (_, _) => { _rateStore.MarkLimited(acc.Email); Refresh(); };
             var clearItem = new ToolStripMenuItem(limited
-                ? $"Clear  (limited since {_store.LimitedAt(acc.Email):HH:mm})"
+                ? $"Clear  (limited since {_rateStore.LimitedAt(acc.Email):HH:mm})"
                 : "Clear rate limit") { Enabled = limited };
-            clearItem.Click += (_, _) => { _store.ClearLimit(acc.Email); Refresh(); };
+            clearItem.Click += (_, _) => { _rateStore.ClearLimit(acc.Email); Refresh(); };
             mi.DropDownItems.Add(markItem);
             mi.DropDownItems.Add(clearItem);
             menu.Items.Add(mi);
-
-            // usage bar row
             menu.Items.Add(MakeBarItem(acc.Email, limited));
         }
 
         menu.Items.Add(new ToolStripSeparator());
 
-        // ── auto-switch toggle ──
+        // auto-switch toggle
         var autoSwitch = new ToolStripMenuItem("Auto-switch on rate limit")
         {
-            Checked = _store.AutoSwitch,
+            Checked = _rateStore.AutoSwitch,
             CheckOnClick = true,
         };
-        autoSwitch.CheckedChanged += (_, _) => { _store.AutoSwitch = autoSwitch.Checked; };
+        autoSwitch.CheckedChanged += (_, _) => { _rateStore.AutoSwitch = autoSwitch.Checked; };
         menu.Items.Add(autoSwitch);
 
         menu.Items.Add(new ToolStripSeparator());
 
-        // ── account management ──
-        var add = new ToolStripMenuItem("Add account…");
+        // account management
+        var add = new ToolStripMenuItem("Save current session as account…");
         add.Click += (_, _) => AddAccount();
         menu.Items.Add(add);
 
@@ -220,9 +176,9 @@ class TrayContext : ApplicationContext
             var removeMenu = new ToolStripMenuItem("Remove account");
             foreach (var acc in accounts)
             {
-                var num = acc.Num; var email = acc.Email;
+                var email = acc.Email;
                 var ri = new ToolStripMenuItem(email);
-                ri.Click += (_, _) => RemoveAccount(num, email);
+                ri.Click += (_, _) => RemoveAccount(email);
                 removeMenu.DropDownItems.Add(ri);
             }
             menu.Items.Add(removeMenu);
@@ -243,6 +199,8 @@ class TrayContext : ApplicationContext
         return menu;
     }
 
+    // ── usage bar ──────────────────────────────────────────────────────────
+
     ToolStripItem MakeBarItem(string email, bool limited)
     {
         const int total = 20;
@@ -256,7 +214,7 @@ class TrayContext : ApplicationContext
         }
         else
         {
-            var since = _store.LimitedAt(email);
+            var since = _rateStore.LimitedAt(email);
             if (!since.HasValue)
             {
                 barText = new string('░', total) + "  ⚠ limited";
@@ -264,7 +222,7 @@ class TrayContext : ApplicationContext
             }
             else
             {
-                var window = TimeSpan.FromHours(_store.ResetHours);
+                var window = TimeSpan.FromHours(_rateStore.ResetHours);
                 var elapsed = DateTime.Now - since.Value;
                 if (elapsed > window) elapsed = window;
                 int filled = (int)(elapsed.TotalSeconds / window.TotalSeconds * total);
@@ -287,7 +245,6 @@ class TrayContext : ApplicationContext
             Padding = new Padding(0),
             Margin = new Padding(0),
         };
-
         return new ToolStripControlHost(lbl)
         {
             Margin = new Padding(28, 0, 4, 3),
@@ -296,9 +253,9 @@ class TrayContext : ApplicationContext
 
     string FormatRemaining(string email)
     {
-        var since = _store.LimitedAt(email);
+        var since = _rateStore.LimitedAt(email);
         if (!since.HasValue) return "";
-        var rem = TimeSpan.FromHours(_store.ResetHours) - (DateTime.Now - since.Value);
+        var rem = TimeSpan.FromHours(_rateStore.ResetHours) - (DateTime.Now - since.Value);
         if (rem <= TimeSpan.Zero) return "resets soon";
         return rem.TotalHours >= 1
             ? $"{(int)rem.TotalHours}h {rem.Minutes:D2}m"
@@ -307,64 +264,93 @@ class TrayContext : ApplicationContext
 
     // ── actions ────────────────────────────────────────────────────────────
 
-    void SwitchTo(int num, string email, bool autoRestart = false)
+    void DoSwitch(string email, bool autoRestart = false)
     {
-        RunCmd("cswap", $"--switch-to {num}");
-
-        // immediately reflect new active account without re-querying cswap
-        _accounts = _accounts.Select(a => a with { Active = a.Num == num }).ToList();
-        UpdateUI(_accounts);
-
-        if (autoRestart)
+        var err = _accounts.SwitchTo(email);
+        if (err is not null)
         {
-            _tray.ShowBalloonTip(4000, "Auto-switched",
-                $"Switched to {email}.\nRestarting Claude Code…", ToolTipIcon.Info);
-            Thread.Sleep(1500);
-            RestartClaude();
+            _tray.ShowBalloonTip(4000, "Switch failed", err, ToolTipIcon.Error);
+            return;
         }
-        else
-        {
-            _tray.ShowBalloonTip(3000, "Switched",
-                $"Now using {email}\nRestart Claude Code to apply.", ToolTipIcon.Info);
-        }
+
+        _cached = _cached.Select(a => a with { Active = a.Email == email }).ToList();
+        UpdateUI(_cached);
+
+        _tray.ShowBalloonTip(4000, "Switched",
+            $"Switched to {email}.\nRestarting Claude Code…", ToolTipIcon.Info);
+        Thread.Sleep(1500);
+        RestartClaude();
     }
 
     void AddAccount()
     {
-        if (MessageBox.Show(
-            "Log into the new account in Claude Code first.\n\n" +
-            "  claude /logout\n  claude /login\n\n" +
-            "Click OK when done.",
-            "Add Account", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+        var email = ShowInputDialog(
+            "Save the currently logged-in Claude session as a named account.\n\n" +
+            "Enter the email address for this session:",
+            "Save Account");
+        if (string.IsNullOrWhiteSpace(email)) return;
 
-        var output = RunCmd("cswap", "--add-account").Trim();
+        var err = _accounts.AddCurrent(email.Trim());
+        if (err is not null)
+        {
+            MessageBox.Show(err, "Save Account", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
         Refresh();
-        _tray.ShowBalloonTip(3000, "Add Account", output.Length > 0 ? output : "Done.", ToolTipIcon.Info);
+        _tray.ShowBalloonTip(3000, "Account saved", $"Saved {email}.", ToolTipIcon.Info);
     }
 
-    void RemoveAccount(int num, string email)
+    void RemoveAccount(string email)
     {
         if (MessageBox.Show($"Remove account {email}?", "Remove Account",
             MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
 
-        RunCmd("cswap", $"--remove-account {num}");
-        _store.ClearLimit(email);
+        _accounts.Remove(email);
+        _rateStore.ClearLimit(email);
         Refresh();
         _tray.ShowBalloonTip(2000, "Remove Account", $"Removed {email}.", ToolTipIcon.Info);
     }
 
     void RestartClaude()
     {
-        RunCmd("taskkill", "/F /IM claude.exe");
-        Thread.Sleep(800);
-        Process.Start(new ProcessStartInfo("claude")
+        foreach (var p in Process.GetProcessesByName("claude"))
+            try { p.Kill(); } catch { }
+        Thread.Sleep(1200);
+        try
         {
-            UseShellExecute = true,
-            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        });
+            Process.Start(new ProcessStartInfo("claude")
+            {
+                UseShellExecute = true,
+                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            });
+        }
+        catch { }
+    }
+
+    static string? ShowInputDialog(string prompt, string title)
+    {
+        var form = new Form
+        {
+            Text = title, Width = 420, Height = 170,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false, MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterScreen,
+        };
+        var lbl = new Label { Text = prompt, Left = 12, Top = 12, Width = 385, Height = 56, AutoSize = false };
+        var txt = new TextBox { Left = 12, Top = 72, Width = 385 };
+        var ok = new Button { Text = "OK", Left = 220, Top = 100, Width = 84, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", Left = 313, Top = 100, Width = 84, DialogResult = DialogResult.Cancel };
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+        form.Controls.AddRange([lbl, txt, ok, cancel]);
+        return form.ShowDialog() == DialogResult.OK ? txt.Text : null;
     }
 
     // ── tray icon ──────────────────────────────────────────────────────────
+
+    private static readonly string ClaudeExe = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".local", "bin", "claude.exe");
 
     Icon BuildTrayIcon(Account? active, bool limited)
     {
@@ -430,12 +416,195 @@ class TrayContext : ApplicationContext
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Account store — manages ~/.claude/accounts/*.json, swaps .credentials.json
+// ══════════════════════════════════════════════════════════════════════════════
+
+class AccountStore
+{
+    private static readonly string AccountsDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude", "accounts");
+
+    private static readonly string CredPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude", ".credentials.json");
+
+    private static readonly string StorePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude", "claude-switcher.json");
+
+    private string? _activeEmail;
+
+    public AccountStore()
+    {
+        _activeEmail = LoadActiveEmail() ?? DetectActiveEmail();
+    }
+
+    // ── public API ──────────────────────────────────────────────────────────
+
+    public List<Account> List()
+    {
+        var files = GetAccountFiles();
+        var result = new List<(string Email, string File)>();
+
+        foreach (var f in files)
+        {
+            try
+            {
+                var node = JsonNode.Parse(File.ReadAllText(f));
+                var email = node?["email"]?.GetValue<string>();
+                if (email is not null) result.Add((email, f));
+            }
+            catch { }
+        }
+
+        result.Sort((a, b) => string.Compare(a.Email, b.Email, StringComparison.OrdinalIgnoreCase));
+
+        return result
+            .Select((r, i) => new Account(i + 1, r.Email, r.Email == _activeEmail))
+            .ToList();
+    }
+
+    // Returns null on success, error message on failure.
+    public string? SwitchTo(string email)
+    {
+        try
+        {
+            var file = FindFile(email) ?? throw new FileNotFoundException($"Account not found: {email}");
+            var node = JsonNode.Parse(File.ReadAllText(file))
+                ?? throw new InvalidOperationException("Could not parse account file");
+            var cred = node["credentials"]
+                ?? throw new InvalidOperationException("Account file has no 'credentials' field");
+
+            File.WriteAllText(CredPath,
+                cred.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            SaveActiveEmail(email);
+            return null;
+        }
+        catch (Exception ex) { return ex.Message; }
+    }
+
+    // Saves the currently active .credentials.json under the given email.
+    public string? AddCurrent(string email)
+    {
+        try
+        {
+            if (!File.Exists(CredPath))
+                return "No active session found (~/.claude/.credentials.json is missing).\n" +
+                       "Log into Claude Code first.";
+
+            var cred = JsonNode.Parse(File.ReadAllText(CredPath))
+                       ?? throw new InvalidOperationException("Could not parse credentials");
+
+            Directory.CreateDirectory(AccountsDir);
+
+            var obj = new JsonObject
+            {
+                ["email"] = email,
+                ["credentials"] = JsonNode.Parse(cred.ToJsonString()),
+            };
+            File.WriteAllText(GetFilePath(email),
+                obj.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+
+            SaveActiveEmail(email);
+            return null;
+        }
+        catch (Exception ex) { return ex.Message; }
+    }
+
+    public void Remove(string email)
+    {
+        var file = FindFile(email);
+        if (file is not null) File.Delete(file);
+        if (_activeEmail == email) SaveActiveEmail(null);
+    }
+
+    // ── internals ──────────────────────────────────────────────────────────
+
+    private string[] GetAccountFiles()
+    {
+        if (!Directory.Exists(AccountsDir)) return [];
+        return Directory.GetFiles(AccountsDir, "*.json");
+    }
+
+    private string? FindFile(string email)
+    {
+        foreach (var f in GetAccountFiles())
+        {
+            try
+            {
+                var node = JsonNode.Parse(File.ReadAllText(f));
+                if (node?["email"]?.GetValue<string>() == email) return f;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    // Compare refreshToken to detect which stored account is currently active.
+    private string? DetectActiveEmail()
+    {
+        try
+        {
+            if (!File.Exists(CredPath)) return null;
+            var current = JsonNode.Parse(File.ReadAllText(CredPath));
+            var currentRefresh = current?["claudeAiOauth"]?["refreshToken"]?.GetValue<string>();
+            if (currentRefresh is null) return null;
+
+            foreach (var f in GetAccountFiles())
+            {
+                try
+                {
+                    var stored = JsonNode.Parse(File.ReadAllText(f));
+                    var storedRefresh = stored?["credentials"]?
+                        ["claudeAiOauth"]?["refreshToken"]?.GetValue<string>();
+                    if (storedRefresh == currentRefresh)
+                        return stored?["email"]?.GetValue<string>();
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private string? LoadActiveEmail()
+    {
+        try
+        {
+            if (!File.Exists(StorePath)) return null;
+            return JsonNode.Parse(File.ReadAllText(StorePath))?["activeEmail"]?.GetValue<string>();
+        }
+        catch { return null; }
+    }
+
+    private void SaveActiveEmail(string? email)
+    {
+        _activeEmail = email;
+        try
+        {
+            JsonNode node = File.Exists(StorePath)
+                ? JsonNode.Parse(File.ReadAllText(StorePath)) ?? new JsonObject()
+                : new JsonObject();
+            node["activeEmail"] = email;
+            File.WriteAllText(StorePath,
+                node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
+    private static string GetFilePath(string email) =>
+        Path.Combine(AccountsDir,
+            Regex.Replace(email, @"[^\w@.\-]", "_") + ".json");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Rate limit store  (~/.claude/claude-switcher.json)
 // ══════════════════════════════════════════════════════════════════════════════
 
 class RateLimitStore
 {
-    private static readonly string Path_ = System.IO.Path.Combine(
+    private static readonly string Path_ = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".claude", "claude-switcher.json");
 
@@ -502,14 +671,13 @@ class RateLimitStore
 class LogWatcher : IDisposable
 {
     private readonly Action _callback;
-    private readonly List<FileSystemWatcher> _watchers = new();
+    private readonly List<FileSystemWatcher> _watchers = [];
     private DateTime _lastFired = DateTime.MinValue;
 
     private static readonly string[] WatchDirs =
     [
-        System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"),
-        System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Claude"),
     ];
 
     private static readonly Regex RlPattern = new(
@@ -544,7 +712,7 @@ class LogWatcher : IDisposable
         try
         {
             if (!File.Exists(e.FullPath)) return;
-            var ext = System.IO.Path.GetExtension(e.FullPath).ToLower();
+            var ext = Path.GetExtension(e.FullPath).ToLower();
             if (ext is not (".log" or ".txt" or ".json" or "")) return;
 
             using var fs = new FileStream(e.FullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);

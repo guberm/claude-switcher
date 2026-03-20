@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Claude Account Tray Switcher
+Claude Account Tray Switcher — native, no cswap dependency.
+Manages ~/.claude/accounts/*.json and swaps ~/.claude/.credentials.json.
+
 Run: uv run --with pystray --with pillow claude-tray.py
 Or:  see claude-tray.vbs
 """
@@ -24,6 +26,12 @@ COLORS = ["#4A90D9", "#E8754A", "#5CB85C", "#9B59B6", "#F39C12", "#E74C3C"]
 CLAUDE_EXE = os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe")
 BAR_TOTAL = 20
 
+HOME = os.path.expanduser("~")
+CLAUDE_DIR     = os.path.join(HOME, ".claude")
+CRED_PATH      = os.path.join(CLAUDE_DIR, ".credentials.json")
+ACCOUNTS_DIR   = os.path.join(CLAUDE_DIR, "accounts")
+SWITCHER_PATH  = os.path.join(CLAUDE_DIR, "claude-switcher.json")
+
 # ── single instance (Windows Mutex) ──────────────────────────────────────────
 
 _kernel32 = ctypes.windll.kernel32
@@ -46,11 +54,152 @@ IDYES = 6
 def msgbox(title, text, style=MB_OK):
     return ctypes.windll.user32.MessageBoxW(0, text, title, style)
 
+def input_dialog(prompt: str, title: str) -> str | None:
+    """Show a Windows InputBox via PowerShell and return the entered string."""
+    ps = (
+        f"Add-Type -AssemblyName Microsoft.VisualBasic; "
+        f"[Microsoft.VisualBasic.Interaction]::InputBox('{prompt}', '{title}', '')"
+    )
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps],
+        capture_output=True, text=True
+    )
+    val = r.stdout.strip()
+    return val if val else None
+
+
+# ── account store ─────────────────────────────────────────────────────────────
+
+class AccountStore:
+    """Manages named account credential files; switches by copying to .credentials.json."""
+
+    def __init__(self):
+        self._active_email: str | None = self._load_active_email() or self._detect_active_email()
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def list(self) -> list[dict]:
+        """Return sorted list of {num, email, active} dicts."""
+        entries = []
+        for f in self._account_files():
+            try:
+                data = json.loads(open(f).read())
+                email = data.get("email")
+                if email:
+                    entries.append(email)
+            except Exception:
+                pass
+        entries.sort(key=str.lower)
+        return [
+            {"num": i + 1, "email": e, "active": e == self._active_email}
+            for i, e in enumerate(entries)
+        ]
+
+    def switch_to(self, email: str) -> str | None:
+        """Copy stored credentials for email → .credentials.json. Returns error or None."""
+        try:
+            f = self._find_file(email) or (_ for _ in ()).throw(
+                FileNotFoundError(f"Account not found: {email}"))
+            data = json.loads(open(f).read())
+            cred = data.get("credentials") or (_ for _ in ()).throw(
+                ValueError("Account file has no 'credentials' field"))
+            os.makedirs(CLAUDE_DIR, exist_ok=True)
+            with open(CRED_PATH, "w") as out:
+                json.dump(cred, out, indent=2)
+            self._save_active_email(email)
+            return None
+        except Exception as e:
+            return str(e)
+
+    def add_current(self, email: str) -> str | None:
+        """Save the current .credentials.json as a named account. Returns error or None."""
+        try:
+            if not os.path.exists(CRED_PATH):
+                return ("No active session found (~/.claude/.credentials.json missing).\n"
+                        "Log into Claude Code first.")
+            cred = json.loads(open(CRED_PATH).read())
+            os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+            obj = {"email": email, "credentials": cred}
+            with open(self._file_path(email), "w") as out:
+                json.dump(obj, out, indent=2)
+            self._save_active_email(email)
+            return None
+        except Exception as e:
+            return str(e)
+
+    def remove(self, email: str):
+        f = self._find_file(email)
+        if f:
+            os.unlink(f)
+        if self._active_email == email:
+            self._save_active_email(None)
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _account_files(self) -> list[str]:
+        if not os.path.isdir(ACCOUNTS_DIR):
+            return []
+        return [os.path.join(ACCOUNTS_DIR, f)
+                for f in os.listdir(ACCOUNTS_DIR) if f.endswith(".json")]
+
+    def _find_file(self, email: str) -> str | None:
+        for f in self._account_files():
+            try:
+                if json.loads(open(f).read()).get("email") == email:
+                    return f
+            except Exception:
+                pass
+        return None
+
+    def _detect_active_email(self) -> str | None:
+        """Match current .credentials.json refreshToken against stored accounts."""
+        try:
+            current = json.loads(open(CRED_PATH).read())
+            current_rt = current.get("claudeAiOauth", {}).get("refreshToken")
+            if not current_rt:
+                return None
+            for f in self._account_files():
+                try:
+                    data = json.loads(open(f).read())
+                    stored_rt = (data.get("credentials", {})
+                                     .get("claudeAiOauth", {})
+                                     .get("refreshToken"))
+                    if stored_rt == current_rt:
+                        return data.get("email")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def _load_active_email(self) -> str | None:
+        try:
+            return json.loads(open(SWITCHER_PATH).read()).get("activeEmail")
+        except Exception:
+            return None
+
+    def _save_active_email(self, email: str | None):
+        self._active_email = email
+        try:
+            try:
+                data = json.loads(open(SWITCHER_PATH).read())
+            except Exception:
+                data = {}
+            data["activeEmail"] = email
+            with open(SWITCHER_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _file_path(email: str) -> str:
+        safe = re.sub(r"[^\w@.\-]", "_", email)
+        return os.path.join(ACCOUNTS_DIR, safe + ".json")
+
+
 # ── rate limit store ──────────────────────────────────────────────────────────
 
 class RateLimitStore:
-    _path = os.path.join(os.path.expanduser("~"), ".claude", "claude-switcher.json")
-
     def __init__(self):
         self._limits: dict[str, str] = {}
         self._auto_switch = True
@@ -118,8 +267,7 @@ class RateLimitStore:
 
     def _load(self):
         try:
-            with open(self._path) as f:
-                data = json.load(f)
+            data = json.loads(open(SWITCHER_PATH).read())
             self._auto_switch = data.get("autoSwitch", True)
             self._reset_hours = data.get("resetHours", 5.0)
             self._limits = data.get("rateLimits", {})
@@ -128,13 +276,16 @@ class RateLimitStore:
 
     def _save(self):
         try:
-            os.makedirs(os.path.dirname(self._path), exist_ok=True)
-            with open(self._path, "w") as f:
-                json.dump({
-                    "autoSwitch": self._auto_switch,
-                    "resetHours": self._reset_hours,
-                    "rateLimits": self._limits,
-                }, f, indent=2)
+            try:
+                data = json.loads(open(SWITCHER_PATH).read())
+            except Exception:
+                data = {}
+            data["autoSwitch"] = self._auto_switch
+            data["resetHours"] = self._reset_hours
+            data["rateLimits"] = self._limits
+            os.makedirs(os.path.dirname(SWITCHER_PATH), exist_ok=True)
+            with open(SWITCHER_PATH, "w") as f:
+                json.dump(data, f, indent=2)
         except Exception:
             pass
 
@@ -146,7 +297,7 @@ RATE_LIMIT_RE = re.compile(
     re.IGNORECASE)
 
 WATCH_DIRS = [
-    os.path.join(os.path.expanduser("~"), ".claude"),
+    os.path.join(HOME, ".claude"),
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Claude"),
 ]
 
@@ -202,33 +353,11 @@ class LogWatcher:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def parse_accounts() -> list[dict]:
-    try:
-        r = subprocess.run(["cswap", "--list"], capture_output=True, text=True, timeout=5)
-        accounts = []
-        for line in r.stdout.splitlines():
-            m = re.match(r"\s*(\d+):\s+(.+?)(\s+\(active\))?\s*$", line)
-            if m:
-                accounts.append({
-                    "num": int(m.group(1)),
-                    "email": m.group(2).strip(),
-                    "active": m.group(3) is not None,
-                })
-        return accounts
-    except Exception:
-        return []
-
-
-def active_account(accounts):
-    return next((a for a in accounts if a["active"]), None)
-
-
 def hex_to_rgb(h):
     return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
 
 
 def build_bar(email: str, limited: bool) -> str:
-    """Return a Unicode bar string for this account."""
     if not limited:
         return "  " + "█" * BAR_TOTAL + "  ✓ available"
     since = _limits.limited_at(email)
@@ -326,23 +455,23 @@ def build_tray_image(active, limited: bool, size=64) -> Image.Image:
 # ── app state ─────────────────────────────────────────────────────────────────
 
 _limits = RateLimitStore()
+_account_store = AccountStore()
 _tray_icon: pystray.Icon | None = None
 _accounts: list[dict] = []
 
 
 def refresh(tray):
     global _accounts
-    _accounts = parse_accounts()
+    _accounts = _account_store.list()
     _update_ui(tray, _accounts)
 
 
 def _update_ui(tray, accounts):
-    # auto-clear expired limits
     for acc in accounts:
         if _limits.is_expired(acc["email"]):
             _limits.clear_limit(acc["email"])
 
-    active = active_account(accounts)
+    active = next((a for a in accounts if a["active"]), None)
     limited = active is not None and _limits.is_limited(active["email"])
     tray.icon = build_tray_image(active, limited)
     tray.title = (
@@ -357,8 +486,8 @@ def _update_ui(tray, accounts):
 def on_rate_limit_detected():
     if _tray_icon is None:
         return
-    accounts = parse_accounts()
-    active = active_account(accounts)
+    accounts = _account_store.list()
+    active = next((a for a in accounts if a["active"]), None)
     if active is None or _limits.is_limited(active["email"]):
         return
 
@@ -369,7 +498,7 @@ def on_rate_limit_detected():
         nxt = next((a for a in accounts
                     if not a["active"] and not _limits.is_limited(a["email"])), None)
         if nxt:
-            do_switch(_tray_icon, nxt["num"], nxt["email"], auto_restart=True)
+            do_switch(_tray_icon, nxt["email"], auto_restart=True)
             return
 
     _tray_icon.notify(
@@ -379,64 +508,64 @@ def on_rate_limit_detected():
 
 # ── actions ───────────────────────────────────────────────────────────────────
 
-def do_switch(tray, num, email, auto_restart=False):
+def do_switch(tray, email: str, auto_restart=False):
     global _accounts
-    subprocess.run(["cswap", "--switch-to", str(num)], capture_output=True, timeout=5)
+    err = _account_store.switch_to(email)
+    if err:
+        tray.notify(f"Switch failed: {err}", "Error")
+        return
 
-    # immediately reflect new active account without re-querying cswap
-    _accounts = [dict(a, active=(a["num"] == num)) for a in _accounts]
+    _accounts = [dict(a, active=(a["email"] == email)) for a in _accounts]
     _update_ui(tray, _accounts)
 
-    if auto_restart:
-        tray.notify(
-            f"Rate limit detected → switched to {email}.\nRestarting Claude Code…",
-            "Auto-switched")
-        time.sleep(1.5)
-        do_restart_claude()
-    else:
-        tray.notify(f"Now using {email}\nRestart Claude Code to apply.", "Switched")
+    tray.notify(f"Switched to {email}.\nRestarting Claude Code…", "Switched")
+    time.sleep(1.5)
+    do_restart_claude()
 
 
 def do_add_account(tray):
-    ret = msgbox(
-        "Add Account",
-        "Log into the new account in Claude Code first.\n\n"
-        "  claude /logout\n  claude /login\n\n"
-        "Click OK when done.",
-        MB_OKCANCEL | MB_ICONINFO)
-    if ret != IDOK:
+    email = input_dialog(
+        "Save the currently logged-in Claude session as a named account.\\n\\n"
+        "Enter the email address for this session:",
+        "Save Account")
+    if not email:
         return
-    r = subprocess.run(["cswap", "--add-account"], capture_output=True, text=True, timeout=5)
+    email = email.strip()
+    err = _account_store.add_current(email)
+    if err:
+        msgbox("Save Account", err, MB_OK)
+        return
     refresh(tray)
-    tray.notify((r.stdout or r.stderr or "Done.").strip(), "Add Account")
+    tray.notify(f"Saved {email}.", "Account saved")
 
 
-def do_remove_account(tray, num, email):
+def do_remove_account(tray, email: str):
     ret = msgbox("Remove Account", f"Remove account {email}?", MB_YESNO | MB_ICONQUESTION)
     if ret != IDYES:
         return
-    subprocess.run(["cswap", "--remove-account", str(num)], capture_output=True, timeout=5)
+    _account_store.remove(email)
     _limits.clear_limit(email)
     refresh(tray)
     tray.notify(f"Removed {email}.", "Remove Account")
 
 
 def do_restart_claude():
-    subprocess.run(["taskkill", "/F", "/IM", "claude.exe"], capture_output=True)
-    time.sleep(1)
-    subprocess.Popen("claude", shell=True, cwd=os.path.expanduser("~"))
+    for proc in ["claude.exe"]:
+        subprocess.run(["taskkill", "/F", "/IM", proc], capture_output=True)
+    time.sleep(1.2)
+    subprocess.Popen("claude", shell=True, cwd=HOME)
 
 
 # ── menu ──────────────────────────────────────────────────────────────────────
 
 def build_menu(tray, accounts=None):
     if accounts is None:
-        accounts = _accounts or parse_accounts()
+        accounts = _accounts or _account_store.list()
 
-    active = active_account(accounts)
+    active = next((a for a in accounts if a["active"]), None)
     rows = []
 
-    # ── header ──
+    # header
     if active:
         limited = _limits.is_limited(active["email"])
         header_label = f"{'⚠' if limited else '●'}  {active['email']}"
@@ -445,7 +574,7 @@ def build_menu(tray, accounts=None):
     rows.append(item(header_label, None, enabled=False))
     rows.append(Menu.SEPARATOR)
 
-    # ── accounts + bars ──
+    # accounts + bars
     for acc in accounts:
         limited = _limits.is_limited(acc["email"])
         prefix = "✓  " if acc["active"] else "     "
@@ -453,16 +582,15 @@ def build_menu(tray, accounts=None):
         if acc["active"]:
             rows.append(item(prefix + acc["email"], None, enabled=False))
         else:
-            def make_switch(num, email):
-                return lambda i, _: do_switch(i, num, email)
-            rows.append(item(prefix + acc["email"], make_switch(acc["num"], acc["email"])))
+            def make_switch(email):
+                return lambda i, _: do_switch(i, email)
+            rows.append(item(prefix + acc["email"], make_switch(acc["email"])))
 
-        # usage bar (disabled label row)
         rows.append(item(build_bar(acc["email"], limited), None, enabled=False))
 
     rows.append(Menu.SEPARATOR)
 
-    # ── rate limit mark/clear per account ──
+    # rate limit mark/clear per account
     if accounts:
         limit_items = []
         for acc in accounts:
@@ -484,7 +612,7 @@ def build_menu(tray, accounts=None):
             limit_items.append(item(email, Menu(*sub)))
         rows.append(item("Rate limits ▶", Menu(*limit_items)))
 
-    # ── auto-switch toggle ──
+    # auto-switch toggle
     def toggle_auto_switch(i, _):
         _limits.auto_switch = not _limits.auto_switch
         refresh(i)
@@ -493,13 +621,12 @@ def build_menu(tray, accounts=None):
     rows.append(item(auto_label, toggle_auto_switch))
 
     rows.append(Menu.SEPARATOR)
-
-    rows.append(item("Add account…", lambda i, _: do_add_account(i)))
+    rows.append(item("Save current session as account…", lambda i, _: do_add_account(i)))
 
     if accounts:
-        def make_remove(num, email):
-            return lambda i, _: do_remove_account(i, num, email)
-        remove_items = [item(a["email"], make_remove(a["num"], a["email"])) for a in accounts]
+        def make_remove(email):
+            return lambda i, _: do_remove_account(i, email)
+        remove_items = [item(a["email"], make_remove(a["email"])) for a in accounts]
         rows.append(item("Remove account ▶", Menu(*remove_items)))
 
     rows.append(Menu.SEPARATOR)
@@ -515,8 +642,8 @@ def build_menu(tray, accounts=None):
 def main():
     global _tray_icon, _accounts
 
-    _accounts = parse_accounts()
-    active = active_account(_accounts)
+    _accounts = _account_store.list()
+    active = next((a for a in _accounts if a["active"]), None)
     limited = active is not None and _limits.is_limited(active["email"])
     img = build_tray_image(active, limited)
     title = f"Claude: {active['email']}" if active else "Claude Account Switcher"
