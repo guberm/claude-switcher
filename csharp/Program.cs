@@ -149,78 +149,29 @@ class TrayContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Font = new Font("Segoe UI", 9f);
 
-        // ── active account header ──
+        // ── header ──
         bool activeLimited = active is not null && _store.IsLimited(active.Email);
-        string headerIcon = activeLimited ? "⚠" : "●";
-        string headerText = active is not null
-            ? $"{headerIcon}  {active.Email}"
-            : "No active account";
-
-        var header = new ToolStripMenuItem(headerText)
+        menu.Items.Add(new ToolStripMenuItem(
+            active is not null
+                ? $"{(activeLimited ? "⚠" : "●")}  {active.Email}"
+                : "No active account")
         {
             Enabled = false,
             Font = new Font("Segoe UI", 9f, FontStyle.Bold),
             ForeColor = activeLimited ? Color.OrangeRed : SystemColors.ControlText,
-        };
-        menu.Items.Add(header);
-
-        // ── rate limit progress bar (only when limited) ──
-        if (activeLimited && active is not null)
-        {
-            var since = _store.LimitedAt(active.Email);
-            if (since.HasValue)
-            {
-                var elapsed = DateTime.Now - since.Value;
-                var window = TimeSpan.FromHours(_store.ResetHours);
-                var remaining = window - elapsed;
-                if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
-                int pct = (int)Math.Min(100, elapsed.TotalSeconds / window.TotalSeconds * 100);
-
-                // label
-                string remainStr = remaining.TotalMinutes < 1
-                    ? "resets soon"
-                    : remaining.TotalHours >= 1
-                        ? $"resets in {(int)remaining.TotalHours}h {remaining.Minutes:D2}m"
-                        : $"resets in {(int)remaining.TotalMinutes}m";
-
-                var lbl = new ToolStripMenuItem(remainStr)
-                {
-                    Enabled = false,
-                    ForeColor = Color.OrangeRed,
-                    Font = new Font("Segoe UI", 8f),
-                    Padding = new Padding(22, 0, 4, 0),
-                };
-                menu.Items.Add(lbl);
-
-                // progress bar (fills left→right as time-to-reset counts down)
-                var pb = new ToolStripProgressBar
-                {
-                    Minimum = 0,
-                    Maximum = 100,
-                    Value = 100 - pct,   // full = just limited, empty = about to reset
-                    Size = new Size(160, 14),
-                    Margin = new Padding(26, 2, 8, 4),
-                    Style = ProgressBarStyle.Continuous,
-                };
-                menu.Items.Add(pb);
-            }
-        }
+        });
 
         menu.Items.Add(new ToolStripSeparator());
 
-        // ── account list ──
+        // ── account list with per-account usage bar ──
         foreach (var acc in accounts)
         {
             bool limited = _store.IsLimited(acc.Email);
-            string status = limited
-                ? $"  ⚠ {FormatRemaining(acc.Email)}"
-                : "";
 
-            string label = (acc.Active ? "✓  " : "     ") + acc.Email + status;
-            var mi = new ToolStripMenuItem(label);
-
+            // account row
+            string prefix = acc.Active ? "✓  " : "     ";
+            var mi = new ToolStripMenuItem(prefix + acc.Email);
             if (limited) mi.ForeColor = Color.OrangeRed;
-
             if (acc.Active)
             {
                 mi.Enabled = false;
@@ -231,21 +182,19 @@ class TrayContext : ApplicationContext
                 mi.Click += (_, _) => SwitchTo(num, email);
             }
 
-            // right-click submenu: mark / clear limit
-            var markItem = new ToolStripMenuItem("Mark as rate limited");
-            markItem.Enabled = !limited;
+            // right-click: mark / clear
+            var markItem = new ToolStripMenuItem("Mark as rate limited") { Enabled = !limited };
             markItem.Click += (_, _) => { _store.MarkLimited(acc.Email); Refresh(); };
-
             var clearItem = new ToolStripMenuItem(limited
-                ? $"Clear rate limit  (since {_store.LimitedAt(acc.Email):HH:mm})"
-                : "Clear rate limit");
-            clearItem.Enabled = limited;
+                ? $"Clear  (limited since {_store.LimitedAt(acc.Email):HH:mm})"
+                : "Clear rate limit") { Enabled = limited };
             clearItem.Click += (_, _) => { _store.ClearLimit(acc.Email); Refresh(); };
-
             mi.DropDownItems.Add(markItem);
             mi.DropDownItems.Add(clearItem);
-
             menu.Items.Add(mi);
+
+            // usage bar row
+            menu.Items.Add(MakeBarItem(acc.Email, limited));
         }
 
         menu.Items.Add(new ToolStripSeparator());
@@ -272,9 +221,9 @@ class TrayContext : ApplicationContext
             foreach (var acc in accounts)
             {
                 var num = acc.Num; var email = acc.Email;
-                var mi = new ToolStripMenuItem(email);
-                mi.Click += (_, _) => RemoveAccount(num, email);
-                removeMenu.DropDownItems.Add(mi);
+                var ri = new ToolStripMenuItem(email);
+                ri.Click += (_, _) => RemoveAccount(num, email);
+                removeMenu.DropDownItems.Add(ri);
             }
             menu.Items.Add(removeMenu);
         }
@@ -292,6 +241,57 @@ class TrayContext : ApplicationContext
         menu.Items.Add(quit);
 
         return menu;
+    }
+
+    ToolStripItem MakeBarItem(string email, bool limited)
+    {
+        const int total = 20;
+        string barText;
+        Color barColor;
+
+        if (!limited)
+        {
+            barText = new string('█', total) + "  ✓ available";
+            barColor = Color.SeaGreen;
+        }
+        else
+        {
+            var since = _store.LimitedAt(email);
+            if (!since.HasValue)
+            {
+                barText = new string('░', total) + "  ⚠ limited";
+                barColor = Color.OrangeRed;
+            }
+            else
+            {
+                var window = TimeSpan.FromHours(_store.ResetHours);
+                var remaining = window - (DateTime.Now - since.Value);
+                if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
+                int filled = (int)(remaining.TotalSeconds / window.TotalSeconds * total);
+                filled = Math.Clamp(filled, 0, total);
+                barText = new string('█', filled) + new string('░', total - filled)
+                          + $"  ⚠ {FormatRemaining(email)}";
+                barColor = Color.OrangeRed;
+            }
+        }
+
+        var lbl = new Label
+        {
+            Text = barText,
+            Font = new Font("Consolas", 8f),
+            ForeColor = barColor,
+            AutoSize = false,
+            Width = 260,
+            Height = 15,
+            BackColor = Color.Transparent,
+            Padding = new Padding(0),
+            Margin = new Padding(0),
+        };
+
+        return new ToolStripControlHost(lbl)
+        {
+            Margin = new Padding(28, 0, 4, 3),
+        };
     }
 
     string FormatRemaining(string email)
