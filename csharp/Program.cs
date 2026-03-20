@@ -265,9 +265,9 @@ class TrayContext : ApplicationContext
             else
             {
                 var window = TimeSpan.FromHours(_store.ResetHours);
-                var remaining = window - (DateTime.Now - since.Value);
-                if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
-                int filled = (int)(remaining.TotalSeconds / window.TotalSeconds * total);
+                var elapsed = DateTime.Now - since.Value;
+                if (elapsed > window) elapsed = window;
+                int filled = (int)(elapsed.TotalSeconds / window.TotalSeconds * total);
                 filled = Math.Clamp(filled, 0, total);
                 barText = new string('█', filled) + new string('░', total - filled)
                           + $"  ⚠ {FormatRemaining(email)}";
@@ -283,7 +283,7 @@ class TrayContext : ApplicationContext
             AutoSize = false,
             Width = 260,
             Height = 15,
-            BackColor = Color.Transparent,
+            BackColor = SystemColors.Menu,
             Padding = new Padding(0),
             Margin = new Padding(0),
         };

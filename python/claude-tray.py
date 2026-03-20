@@ -235,10 +235,10 @@ def build_bar(email: str, limited: bool) -> str:
     if not since:
         return "  " + "░" * BAR_TOTAL + "  ⚠ limited"
     window = timedelta(hours=_limits.reset_hours)
-    remaining = window - (datetime.now() - since)
-    if remaining.total_seconds() <= 0:
-        remaining = timedelta(0)
-    filled = int(remaining.total_seconds() / window.total_seconds() * BAR_TOTAL)
+    elapsed = datetime.now() - since
+    if elapsed > window:
+        elapsed = window
+    filled = int(elapsed.total_seconds() / window.total_seconds() * BAR_TOTAL)
     filled = max(0, min(BAR_TOTAL, filled))
     bar = "█" * filled + "░" * (BAR_TOTAL - filled)
     return "  " + bar + f"  ⚠ {_limits.format_remaining(email)}"
