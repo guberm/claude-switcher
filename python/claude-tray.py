@@ -509,6 +509,11 @@ _auth_status: dict | None = None
 def refresh(tray):
     global _accounts
     _accounts = _account_store.list()
+    # Sync the active account to match auth status so the header email
+    # and the checkmark always point to the same account.
+    auth_email = (_auth_status or {}).get("email")
+    if auth_email and any(a["email"] == auth_email for a in _accounts):
+        _accounts = [dict(a, active=(a["email"] == auth_email)) for a in _accounts]
     _update_ui(tray, _accounts)
 
 

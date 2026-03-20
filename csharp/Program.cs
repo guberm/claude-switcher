@@ -121,6 +121,10 @@ class TrayContext : ApplicationContext
     void Refresh()
     {
         _cached = _accounts.List();
+        // Sync the active account to match auth status so the header email
+        // and the ✓ checkmark always point to the same account.
+        if (_authStatus is { Email.Length: > 0 } s && _cached.Any(a => a.Email == s.Email))
+            _cached = _cached.Select(a => a with { Active = a.Email == s.Email }).ToList();
         UpdateUI(_cached);
     }
 
