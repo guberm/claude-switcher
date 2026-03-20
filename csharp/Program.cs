@@ -26,6 +26,7 @@ class TrayContext : ApplicationContext
     private readonly NotifyIcon _tray;
     private readonly RateLimitStore _store = new();
     private readonly LogWatcher _watcher;
+    private List<Account> _accounts = new();  // cached list
 
     private static readonly string[] Palette =
         ["#4A90D9", "#E8754A", "#5CB85C", "#9B59B6", "#F39C12", "#E74C3C"];
@@ -112,7 +113,12 @@ class TrayContext : ApplicationContext
 
     void Refresh()
     {
-        var accounts = ParseAccounts();
+        _accounts = ParseAccounts();
+        UpdateUI(_accounts);
+    }
+
+    void UpdateUI(List<Account> accounts)
+    {
         var active = accounts.FirstOrDefault(a => a.Active);
         bool limited = active is not null && _store.IsLimited(active.Email);
 
@@ -304,8 +310,11 @@ class TrayContext : ApplicationContext
     void SwitchTo(int num, string email, bool autoRestart = false)
     {
         RunCmd("cswap", $"--switch-to {num}");
-        Thread.Sleep(400); // give cswap time to write credential store
-        Refresh();
+
+        // immediately reflect new active account without re-querying cswap
+        _accounts = _accounts.Select(a => a with { Active = a.Num == num }).ToList();
+        UpdateUI(_accounts);
+
         if (autoRestart)
         {
             _tray.ShowBalloonTip(4000, "Auto-switched",
