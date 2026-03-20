@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PIL import Image, ImageDraw, ImageFont
 import pystray
@@ -22,6 +22,7 @@ from pystray import Menu, MenuItem as item
 
 COLORS = ["#4A90D9", "#E8754A", "#5CB85C", "#9B59B6", "#F39C12", "#E74C3C"]
 CLAUDE_EXE = os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe")
+BAR_TOTAL = 20
 
 # ── single instance (Windows Mutex) ──────────────────────────────────────────
 
@@ -53,6 +54,7 @@ class RateLimitStore:
     def __init__(self):
         self._limits: dict[str, str] = {}
         self._auto_switch = True
+        self._reset_hours = 5.0
         self._load()
 
     @property
@@ -64,17 +66,47 @@ class RateLimitStore:
         self._auto_switch = value
         self._save()
 
+    @property
+    def reset_hours(self):
+        return self._reset_hours
+
     def is_limited(self, email: str) -> bool:
         return email in self._limits
 
-    def limited_since(self, email: str) -> str | None:
+    def is_expired(self, email: str) -> bool:
         ts = self._limits.get(email)
-        if ts:
-            try:
-                return datetime.fromisoformat(ts).strftime("%H:%M")
-            except Exception:
-                return ts
-        return None
+        if not ts:
+            return False
+        try:
+            since = datetime.fromisoformat(ts)
+            return (datetime.now() - since).total_seconds() / 3600 >= self._reset_hours
+        except Exception:
+            return False
+
+    def limited_at(self, email: str) -> datetime | None:
+        ts = self._limits.get(email)
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+    def limited_since_str(self, email: str) -> str | None:
+        dt = self.limited_at(email)
+        return dt.strftime("%H:%M") if dt else None
+
+    def format_remaining(self, email: str) -> str:
+        since = self.limited_at(email)
+        if not since:
+            return ""
+        rem = timedelta(hours=self._reset_hours) - (datetime.now() - since)
+        if rem.total_seconds() <= 0:
+            return "resets soon"
+        total_min = int(rem.total_seconds() / 60)
+        if total_min >= 60:
+            return f"{total_min // 60}h {total_min % 60:02d}m"
+        return f"{total_min}m"
 
     def mark_limited(self, email: str):
         self._limits[email] = datetime.now().isoformat()
@@ -89,6 +121,7 @@ class RateLimitStore:
             with open(self._path) as f:
                 data = json.load(f)
             self._auto_switch = data.get("autoSwitch", True)
+            self._reset_hours = data.get("resetHours", 5.0)
             self._limits = data.get("rateLimits", {})
         except Exception:
             pass
@@ -97,8 +130,11 @@ class RateLimitStore:
         try:
             os.makedirs(os.path.dirname(self._path), exist_ok=True)
             with open(self._path, "w") as f:
-                json.dump({"autoSwitch": self._auto_switch, "rateLimits": self._limits},
-                          f, indent=2)
+                json.dump({
+                    "autoSwitch": self._auto_switch,
+                    "resetHours": self._reset_hours,
+                    "rateLimits": self._limits,
+                }, f, indent=2)
         except Exception:
             pass
 
@@ -191,6 +227,23 @@ def hex_to_rgb(h):
     return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
 
 
+def build_bar(email: str, limited: bool) -> str:
+    """Return a Unicode bar string for this account."""
+    if not limited:
+        return "  " + "█" * BAR_TOTAL + "  ✓ available"
+    since = _limits.limited_at(email)
+    if not since:
+        return "  " + "░" * BAR_TOTAL + "  ⚠ limited"
+    window = timedelta(hours=_limits.reset_hours)
+    remaining = window - (datetime.now() - since)
+    if remaining.total_seconds() <= 0:
+        remaining = timedelta(0)
+    filled = int(remaining.total_seconds() / window.total_seconds() * BAR_TOTAL)
+    filled = max(0, min(BAR_TOTAL, filled))
+    bar = "█" * filled + "░" * (BAR_TOTAL - filled)
+    return "  " + bar + f"  ⚠ {_limits.format_remaining(email)}"
+
+
 # ── icon building ─────────────────────────────────────────────────────────────
 
 def get_claude_base_icon(size=64) -> Image.Image | None:
@@ -274,10 +327,21 @@ def build_tray_image(active, limited: bool, size=64) -> Image.Image:
 
 _limits = RateLimitStore()
 _tray_icon: pystray.Icon | None = None
+_accounts: list[dict] = []
 
 
 def refresh(tray):
-    accounts = parse_accounts()
+    global _accounts
+    _accounts = parse_accounts()
+    _update_ui(tray, _accounts)
+
+
+def _update_ui(tray, accounts):
+    # auto-clear expired limits
+    for acc in accounts:
+        if _limits.is_expired(acc["email"]):
+            _limits.clear_limit(acc["email"])
+
     active = active_account(accounts)
     limited = active is not None and _limits.is_limited(active["email"])
     tray.icon = build_tray_image(active, limited)
@@ -285,26 +349,25 @@ def refresh(tray):
         f"Claude: {active['email']}{' ⚠' if limited else ''}"
         if active else "Claude Account Switcher"
     )
-    tray.menu = build_menu(tray)
+    tray.menu = build_menu(tray, accounts)
 
 
 # ── rate limit auto-handler ───────────────────────────────────────────────────
 
 def on_rate_limit_detected():
-    """Called from background watcher thread."""
     if _tray_icon is None:
         return
-
     accounts = parse_accounts()
     active = active_account(accounts)
     if active is None or _limits.is_limited(active["email"]):
         return
 
     _limits.mark_limited(active["email"])
-    refresh(_tray_icon)
+    _update_ui(_tray_icon, accounts)
 
     if _limits.auto_switch:
-        nxt = next((a for a in accounts if not a["active"] and not _limits.is_limited(a["email"])), None)
+        nxt = next((a for a in accounts
+                    if not a["active"] and not _limits.is_limited(a["email"])), None)
         if nxt:
             do_switch(_tray_icon, nxt["num"], nxt["email"], auto_restart=True)
             return
@@ -317,17 +380,21 @@ def on_rate_limit_detected():
 # ── actions ───────────────────────────────────────────────────────────────────
 
 def do_switch(tray, num, email, auto_restart=False):
+    global _accounts
     subprocess.run(["cswap", "--switch-to", str(num)], capture_output=True, timeout=5)
-    refresh(tray)
+
+    # immediately reflect new active account without re-querying cswap
+    _accounts = [dict(a, active=(a["num"] == num)) for a in _accounts]
+    _update_ui(tray, _accounts)
+
     if auto_restart:
         tray.notify(
             f"Rate limit detected → switched to {email}.\nRestarting Claude Code…",
             "Auto-switched")
         time.sleep(1.5)
-        do_restart_claude(tray)
+        do_restart_claude()
     else:
-        tray.notify(f"Switched to {email}\nRestart Claude Code to apply.",
-                    "Claude Account Switcher")
+        tray.notify(f"Now using {email}\nRestart Claude Code to apply.", "Switched")
 
 
 def do_add_account(tray):
@@ -354,7 +421,7 @@ def do_remove_account(tray, num, email):
     tray.notify(f"Removed {email}.", "Remove Account")
 
 
-def do_restart_claude(_tray=None):
+def do_restart_claude():
     subprocess.run(["taskkill", "/F", "/IM", "claude.exe"], capture_output=True)
     time.sleep(1)
     subprocess.Popen("claude", shell=True, cwd=os.path.expanduser("~"))
@@ -362,43 +429,46 @@ def do_restart_claude(_tray=None):
 
 # ── menu ──────────────────────────────────────────────────────────────────────
 
-def build_menu(tray):
-    accounts = parse_accounts()
+def build_menu(tray, accounts=None):
+    if accounts is None:
+        accounts = _accounts or parse_accounts()
+
     active = active_account(accounts)
     rows = []
 
-    # header
+    # ── header ──
     if active:
         limited = _limits.is_limited(active["email"])
-        label = f"{'⚠' if limited else '●'}  {active['email']}"
+        header_label = f"{'⚠' if limited else '●'}  {active['email']}"
     else:
-        label = "No active account"
-    rows.append(item(label, None, enabled=False))
+        header_label = "No active account"
+    rows.append(item(header_label, None, enabled=False))
     rows.append(Menu.SEPARATOR)
 
-    # switch accounts
+    # ── accounts + bars ──
     for acc in accounts:
         limited = _limits.is_limited(acc["email"])
-        prefix = "✓  " if acc["active"] else "    "
-        suffix = "  ⚠" if limited else ""
-        label = prefix + acc["email"] + suffix
+        prefix = "✓  " if acc["active"] else "     "
 
         if acc["active"]:
-            rows.append(item(label, None, enabled=False))
+            rows.append(item(prefix + acc["email"], None, enabled=False))
         else:
             def make_switch(num, email):
                 return lambda i, _: do_switch(i, num, email)
-            rows.append(item(label, make_switch(acc["num"], acc["email"])))
+            rows.append(item(prefix + acc["email"], make_switch(acc["num"], acc["email"])))
+
+        # usage bar (disabled label row)
+        rows.append(item(build_bar(acc["email"], limited), None, enabled=False))
 
     rows.append(Menu.SEPARATOR)
 
-    # rate limits submenu per account
+    # ── rate limit mark/clear per account ──
     if accounts:
         limit_items = []
         for acc in accounts:
             email = acc["email"]
             limited = _limits.is_limited(email)
-            since = _limits.limited_since(email)
+            since = _limits.limited_since_str(email)
             clear_label = f"Clear (since {since})" if since else "Clear"
 
             def make_mark(e):
@@ -412,29 +482,28 @@ def build_menu(tray):
                 item(clear_label, make_clear(email), enabled=limited),
             ]
             limit_items.append(item(email, Menu(*sub)))
-        rows.append(item("Rate limits", Menu(*limit_items)))
+        rows.append(item("Rate limits ▶", Menu(*limit_items)))
 
-    # auto-switch toggle
+    # ── auto-switch toggle ──
     def toggle_auto_switch(i, _):
         _limits.auto_switch = not _limits.auto_switch
         refresh(i)
 
-    auto_label = ("✓  " if _limits.auto_switch else "    ") + "Auto-switch on rate limit"
+    auto_label = ("✓  " if _limits.auto_switch else "     ") + "Auto-switch on rate limit"
     rows.append(item(auto_label, toggle_auto_switch))
 
     rows.append(Menu.SEPARATOR)
 
-    # add / remove
     rows.append(item("Add account…", lambda i, _: do_add_account(i)))
 
     if accounts:
         def make_remove(num, email):
             return lambda i, _: do_remove_account(i, num, email)
         remove_items = [item(a["email"], make_remove(a["num"], a["email"])) for a in accounts]
-        rows.append(item("Remove account", Menu(*remove_items)))
+        rows.append(item("Remove account ▶", Menu(*remove_items)))
 
     rows.append(Menu.SEPARATOR)
-    rows.append(item("Restart Claude Code", lambda i, _: do_restart_claude(i)))
+    rows.append(item("Restart Claude Code", lambda i, _: do_restart_claude()))
     rows.append(Menu.SEPARATOR)
     rows.append(item("Quit", lambda i, _: i.stop()))
 
@@ -444,16 +513,16 @@ def build_menu(tray):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _tray_icon
+    global _tray_icon, _accounts
 
-    accounts = parse_accounts()
-    active = active_account(accounts)
+    _accounts = parse_accounts()
+    active = active_account(_accounts)
     limited = active is not None and _limits.is_limited(active["email"])
     img = build_tray_image(active, limited)
     title = f"Claude: {active['email']}" if active else "Claude Account Switcher"
 
     _tray_icon = pystray.Icon("claude-accounts", img, title)
-    _tray_icon.menu = build_menu(_tray_icon)
+    _tray_icon.menu = build_menu(_tray_icon, _accounts)
 
     watcher = LogWatcher(on_rate_limit_detected)
     watcher.start()

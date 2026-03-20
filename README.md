@@ -8,14 +8,14 @@ Built on top of [claude-swap](https://github.com/denysvitali/claude-swap).
 
 ## Features
 
-- **Tray icon** — Claude's own icon extracted from `claude.exe`, with a colored account badge in the corner
-- **Switch accounts** — click an account in the menu, get a balloon notification
-- **Add account** — guided flow: log in via `claude /login`, then confirm
-- **Remove account** — submenu with confirmation dialog
+- **Tray icon** — Claude's own icon with a colored account badge (turns `!` red when rate limited)
+- **Switch accounts** — click an account in the menu; tray updates instantly
+- **Usage bar** — per-account availability bar: `████████████████████ ✓ available` or `██████░░░░░░░░░░░░░░ ⚠ 3h 42m`
+- **Rate limit tracking** — auto-detected from Claude logs; mark/clear manually via submenu
+- **Auto-switch** — on rate limit, automatically switches to the next available account and restarts Claude Code (toggle in menu)
+- **Add / Remove account** — guided flows with confirmation dialogs
 - **Restart Claude Code** — kills and relaunches from your home directory
-- **Rate limit tracking** — mark accounts as limited (⚠), with timestamp; auto-detected from Claude logs
-- **Auto-switch** — when a rate limit is detected, automatically switches to the next available account and restarts Claude Code (toggle on/off from menu)
-- **Single instance** — only one copy runs at a time (Windows Mutex)
+- **Single instance** — Windows Mutex prevents duplicate tray processes
 
 Two implementations are included:
 
@@ -81,14 +81,37 @@ uv run --with pystray --with pillow python\claude-tray.py
 ## Usage
 
 1. Launch `ClaudeTray.exe` (or the Python equivalent)
-2. Right-click the tray icon
-3. Click an account name to switch
-4. When prompted — restart Claude Code (or use **Restart Claude Code** from the menu)
+2. Right-click the tray icon — the menu shows all accounts with usage bars:
+   ```
+   ●  michael.guber@trip-arc.com
+
+   ✓  michael.guber@trip-arc.com
+      ████████████████████  ✓ available
+
+        guberm@gmail.com
+      ██████░░░░░░░░░░░░░░  ⚠ 3h 42m
+   ──────────────────────────────────
+   ☑  Auto-switch on rate limit
+   ```
+3. Click an account to switch; the tray icon badge updates immediately
+4. Use **Restart Claude Code** or restart manually to apply the switch
 
 ### Adding a second account
 
 1. In Claude Code: `claude /logout` → `claude /login` (log in with the new account)
 2. Right-click tray → **Add account…** → click OK
+
+### Configuring the rate-limit reset window
+
+Default is 5 hours (Claude Pro). Edit `~/.claude/claude-switcher.json`:
+
+```json
+{
+  "resetHours": 5.0,
+  "autoSwitch": true,
+  "rateLimits": {}
+}
+```
 
 ---
 
