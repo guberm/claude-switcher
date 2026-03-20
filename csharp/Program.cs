@@ -20,6 +20,7 @@ Application.SetCompatibleTextRenderingDefault(false);
 Application.Run(new TrayContext());
 
 record Account(int Num, string Email, bool Active);
+record AuthStatus(string Email, string? OrgName, string? SubscriptionType);
 
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -29,7 +30,9 @@ class TrayContext : ApplicationContext
     private readonly AccountStore _accounts = new();
     private readonly RateLimitStore _rateStore = new();
     private readonly LogWatcher _watcher;
+    private readonly System.Windows.Forms.Timer _refreshTimer;
     private List<Account> _cached = [];
+    private AuthStatus? _authStatus;
 
     private static readonly string[] Palette =
         ["#4A90D9", "#E8754A", "#5CB85C", "#9B59B6", "#F39C12", "#E74C3C"];
@@ -41,7 +44,47 @@ class TrayContext : ApplicationContext
         _tray = new NotifyIcon { Visible = true };
         _watcher = new LogWatcher(OnRateLimitDetected);
         _watcher.Start();
+
+        _refreshTimer = new System.Windows.Forms.Timer { Interval = 60_000 };
+        _refreshTimer.Tick += (_, _) => { _authStatus = GetAuthStatus(); Refresh(); };
+        _refreshTimer.Start();
+
+        _authStatus = GetAuthStatus();
         Refresh();
+    }
+
+    // ── auth status ────────────────────────────────────────────────────────
+
+    static AuthStatus? GetAuthStatus()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "claude",
+                Arguments = "auth status",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            // Clear any API key override so we get the real OAuth session info.
+            psi.EnvironmentVariables["ANTHROPIC_API_KEY"] = "";
+
+            using var proc = Process.Start(psi)!;
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(5000);
+
+            var node = JsonNode.Parse(output);
+            if (node?["loggedIn"]?.GetValue<bool>() != true) return null;
+
+            return new AuthStatus(
+                node["email"]?.GetValue<string>() ?? "",
+                node["orgName"]?.GetValue<string>(),
+                node["subscriptionType"]?.GetValue<string>()
+            );
+        }
+        catch { return null; }
     }
 
     // ── rate limit callback ────────────────────────────────────────────────
@@ -97,10 +140,24 @@ class TrayContext : ApplicationContext
         _tray.Visible = false;
         _tray.Visible = true;
 
-        _tray.Text = active is not null
-            ? $"Claude: {active.Email}{(limited ? " ⚠ rate limited" : "")}"
+        // Prefer real email from auth status; fall back to stored active account.
+        var displayEmail = _authStatus?.Email is { Length: > 0 } e ? e : active?.Email;
+        var planLabel = FormatPlan(_authStatus);
+
+        _tray.Text = displayEmail is not null
+            ? $"Claude: {displayEmail}{planLabel}{(limited ? " ⚠ rate limited" : "")}"
             : "Claude Account Switcher";
         _tray.ContextMenuStrip = BuildMenu(accounts, active);
+    }
+
+    static string FormatPlan(AuthStatus? s)
+    {
+        if (s is null) return "";
+        var parts = new List<string>();
+        if (s.OrgName is { Length: > 0 } org) parts.Add(org);
+        if (s.SubscriptionType is { Length: > 0 } t)
+            parts.Add(t.Replace("_", " "));
+        return parts.Count > 0 ? $" [{string.Join(" · ", parts)}]" : "";
     }
 
     // ── menu ───────────────────────────────────────────────────────────────
@@ -110,12 +167,14 @@ class TrayContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Font = new Font("Segoe UI", 9f);
 
-        // header
-        bool activeLimited = active is not null && _rateStore.IsLimited(active.Email);
-        menu.Items.Add(new ToolStripMenuItem(
-            active is not null
-                ? $"{(activeLimited ? "⚠" : "●")}  {active.Email}"
-                : "No active account")
+        // header — use real email from auth status if available
+        var realEmail = _authStatus?.Email is { Length: > 0 } e ? e : active?.Email;
+        bool activeLimited = realEmail is not null && _rateStore.IsLimited(realEmail);
+
+        var headerText = realEmail is not null
+            ? $"{(activeLimited ? "⚠" : "●")}  {realEmail}{FormatPlan(_authStatus)}"
+            : "No active account";
+        menu.Items.Add(new ToolStripMenuItem(headerText)
         {
             Enabled = false,
             Font = new Font("Segoe UI", 9f, FontStyle.Bold),
@@ -294,6 +353,7 @@ class TrayContext : ApplicationContext
             $"Switched to {email}.\nRestarting Claude Code…", ToolTipIcon.Info);
         Thread.Sleep(1500);
         RestartClaude();
+        _authStatus = GetAuthStatus();
         Refresh();
     }
 
@@ -331,6 +391,7 @@ class TrayContext : ApplicationContext
         foreach (var p in Process.GetProcessesByName("claude"))
             try { p.Kill(); } catch { }
         Thread.Sleep(1200);
+        ClearElectronProfileCache();
         try
         {
             Process.Start(new ProcessStartInfo("claude")
@@ -340,6 +401,19 @@ class TrayContext : ApplicationContext
             });
         }
         catch { }
+    }
+
+    static void ClearElectronProfileCache()
+    {
+        // Claude Electron app caches the user profile (email, org, plan) in Local Storage.
+        // After a credential switch the cached profile stays stale, showing the old email
+        // while usage data is already fetched fresh from the API.
+        // Deleting the leveldb directory forces Electron to rebuild it on next launch.
+        var leveldb = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Claude", "Local Storage", "leveldb");
+        if (!Directory.Exists(leveldb)) return;
+        try { Directory.Delete(leveldb, recursive: true); } catch { }
     }
 
     static string? ShowInputDialog(string prompt, string title)
@@ -369,7 +443,7 @@ class TrayContext : ApplicationContext
 
     Icon BuildTrayIcon(Account? active, bool limited)
     {
-        const int size = 32;
+        const int size = 128;
         var base_ = TryLoadClaudeIcon();
         var badgeColor = limited ? Color.OrangeRed
             : active is not null ? ParseHex(Palette[(active.Num - 1) % Palette.Length])
@@ -389,18 +463,24 @@ class TrayContext : ApplicationContext
 
     static Icon OverlayBadge(Icon baseIcon, string letter, Color color, int size)
     {
-        using var bmp = new Bitmap(baseIcon.ToBitmap(), size, size);
+        // Scale up the base icon with high-quality bicubic interpolation
+        // so the badge draws at native resolution instead of blurry 32px.
+        using var baseBmp = baseIcon.ToBitmap();
+        using var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(bmp);
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-        const int b = 14;
+        g.DrawImage(baseBmp, 0, 0, size, size);
+
+        int b = size * 14 / 32;   // badge radius, proportional to canvas
         int x = size - b - 1, y = size - b - 1;
         g.FillEllipse(Brushes.Black, x - 1, y - 1, b + 2, b + 2);
         g.FillEllipse(new SolidBrush(color), x, y, b, b);
-        using var font = new Font("Arial", 7, FontStyle.Bold);
+        using var font = new Font("Arial", 7f * size / 32f, FontStyle.Bold);
         var sz = g.MeasureString(letter, font);
         g.DrawString(letter, font, Brushes.White,
-            x + (b - sz.Width) / 2f, y + (b - sz.Height) / 2f - 0.5f);
+            x + (b - sz.Width) / 2f, y + (b - sz.Height) / 2f - 0.5f * size / 32f);
         return Icon.FromHandle(bmp.GetHicon());
     }
 
@@ -411,10 +491,10 @@ class TrayContext : ApplicationContext
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
         g.FillEllipse(new SolidBrush(color), 1, 1, size - 2, size - 2);
-        using var font = new Font("Arial", 14, FontStyle.Bold);
+        using var font = new Font("Arial", 14f * size / 32f, FontStyle.Bold);
         var sz = g.MeasureString(letter, font);
         g.DrawString(letter, font, Brushes.White,
-            (size - sz.Width) / 2f - 1f, (size - sz.Height) / 2f);
+            (size - sz.Width) / 2f - 1f * size / 32f, (size - sz.Height) / 2f);
         return Icon.FromHandle(bmp.GetHicon());
     }
 
@@ -425,7 +505,7 @@ class TrayContext : ApplicationContext
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { _watcher.Dispose(); _tray.Icon?.Dispose(); _tray.Dispose(); }
+        if (disposing) { _refreshTimer.Dispose(); _watcher.Dispose(); _tray.Icon?.Dispose(); _tray.Dispose(); }
         base.Dispose(disposing);
     }
 }

@@ -11,6 +11,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,8 +91,11 @@ class AccountStore:
             except Exception:
                 pass
         entries.sort(key=str.lower)
+        # Always detect from actual credentials file so display stays accurate
+        # even if the user switched accounts outside of this tool.
+        active_email = self._detect_active_email() or self._active_email
         return [
-            {"num": i + 1, "email": e, "active": e == self._active_email}
+            {"num": i + 1, "email": e, "active": e == active_email}
             for i, e in enumerate(entries)
         ]
 
@@ -351,6 +355,47 @@ class LogWatcher:
             pass
 
 
+# ── auth status ───────────────────────────────────────────────────────────────
+
+def get_auth_status() -> dict | None:
+    """Run `claude auth status` and return the parsed JSON, or None on failure."""
+    try:
+        env = os.environ.copy()
+        env["ANTHROPIC_API_KEY"] = ""   # clear any override so OAuth session is used
+        r = subprocess.run(
+            ["claude", "auth", "status"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+        data = json.loads(r.stdout)
+        return data if data.get("loggedIn") else None
+    except Exception:
+        return None
+
+
+def _format_plan(status: dict | None) -> str:
+    if not status:
+        return ""
+    parts = []
+    org = (status.get("orgName") or "").strip()
+    sub = (status.get("subscriptionType") or "").replace("_", " ").strip()
+    if org:
+        parts.append(org)
+    if sub:
+        parts.append(sub)
+    return f" [{' · '.join(parts)}]" if parts else ""
+
+
+def clear_electron_profile_cache():
+    """Delete Electron's Local Storage so Claude Code shows fresh profile after credential switch."""
+    appdata = os.environ.get("APPDATA", "")
+    leveldb = os.path.join(appdata, "Claude", "Local Storage", "leveldb")
+    if os.path.isdir(leveldb):
+        try:
+            shutil.rmtree(leveldb)
+        except Exception:
+            pass
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def hex_to_rgb(h):
@@ -375,7 +420,7 @@ def build_bar(email: str, limited: bool) -> str:
 
 # ── icon building ─────────────────────────────────────────────────────────────
 
-def get_claude_base_icon(size=64) -> Image.Image | None:
+def get_claude_base_icon(size=128) -> Image.Image | None:
     if not os.path.exists(CLAUDE_EXE):
         return None
     try:
@@ -435,7 +480,7 @@ def overlay_badge(base_img: Image.Image, letter: str, hex_color: str, size=64) -
 _claude_base: Image.Image | None = None
 
 
-def build_tray_image(active, limited: bool, size=64) -> Image.Image:
+def build_tray_image(active, limited: bool, size=128) -> Image.Image:
     global _claude_base
     if _claude_base is None:
         _claude_base = get_claude_base_icon(size)
@@ -458,6 +503,7 @@ _limits = RateLimitStore()
 _account_store = AccountStore()
 _tray_icon: pystray.Icon | None = None
 _accounts: list[dict] = []
+_auth_status: dict | None = None
 
 
 def refresh(tray):
@@ -472,11 +518,16 @@ def _update_ui(tray, accounts):
             _limits.clear_limit(acc["email"])
 
     active = next((a for a in accounts if a["active"]), None)
-    limited = active is not None and _limits.is_limited(active["email"])
+    # Prefer real email from auth status over stored active account
+    real_email = (_auth_status or {}).get("email") or (active["email"] if active else None)
+    limited = real_email is not None and _limits.is_limited(real_email)
+
     tray.icon = build_tray_image(active, limited)
+
+    plan_label = _format_plan(_auth_status)
     tray.title = (
-        f"Claude: {active['email']}{' ⚠' if limited else ''}"
-        if active else "Claude Account Switcher"
+        f"Claude: {real_email}{plan_label}{' ⚠' if limited else ''}"
+        if real_email else "Claude Account Switcher"
     )
     tray.menu = build_menu(tray, accounts)
 
@@ -509,7 +560,7 @@ def on_rate_limit_detected():
 # ── actions ───────────────────────────────────────────────────────────────────
 
 def do_switch(tray, email: str, auto_restart=False):
-    global _accounts
+    global _accounts, _auth_status
     err = _account_store.switch_to(email)
     if err:
         tray.notify(f"Switch failed: {err}", "Error")
@@ -521,6 +572,8 @@ def do_switch(tray, email: str, auto_restart=False):
     tray.notify(f"Switched to {email}.\nRestarting Claude Code…", "Switched")
     time.sleep(1.5)
     do_restart_claude()
+    _auth_status = get_auth_status()
+    refresh(tray)
 
 
 def do_add_account(tray):
@@ -553,6 +606,7 @@ def do_restart_claude():
     for proc in ["claude.exe"]:
         subprocess.run(["taskkill", "/F", "/IM", proc], capture_output=True)
     time.sleep(1.2)
+    clear_electron_profile_cache()
     subprocess.Popen("claude", shell=True, cwd=HOME)
 
 
@@ -565,10 +619,12 @@ def build_menu(tray, accounts=None):
     active = next((a for a in accounts if a["active"]), None)
     rows = []
 
-    # header
-    if active:
-        limited = _limits.is_limited(active["email"])
-        header_label = f"{'⚠' if limited else '●'}  {active['email']}"
+    # header — use real email from auth status if available
+    real_email = (_auth_status or {}).get("email") or (active["email"] if active else None)
+    if real_email:
+        limited_hdr = _limits.is_limited(real_email)
+        plan = _format_plan(_auth_status)
+        header_label = f"{'⚠' if limited_hdr else '●'}  {real_email}{plan}"
     else:
         header_label = "No active account"
     rows.append(item(header_label, None, enabled=False))
@@ -640,19 +696,33 @@ def build_menu(tray, accounts=None):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _tray_icon, _accounts
+    global _tray_icon, _accounts, _auth_status
 
+    _auth_status = get_auth_status()
     _accounts = _account_store.list()
     active = next((a for a in _accounts if a["active"]), None)
     limited = active is not None and _limits.is_limited(active["email"])
     img = build_tray_image(active, limited)
-    title = f"Claude: {active['email']}" if active else "Claude Account Switcher"
+
+    real_email = (_auth_status or {}).get("email") or (active["email"] if active else None)
+    plan_label = _format_plan(_auth_status)
+    title = f"Claude: {real_email}{plan_label}" if real_email else "Claude Account Switcher"
 
     _tray_icon = pystray.Icon("claude-accounts", img, title)
     _tray_icon.menu = build_menu(_tray_icon, _accounts)
 
     watcher = LogWatcher(on_rate_limit_detected)
     watcher.start()
+
+    # Refresh auth status and account list every 60 seconds
+    def _periodic_refresh():
+        global _auth_status
+        while True:
+            time.sleep(60)
+            _auth_status = get_auth_status()
+            if _tray_icon:
+                refresh(_tray_icon)
+    threading.Thread(target=_periodic_refresh, daemon=True).start()
 
     _tray_icon.run()
 
