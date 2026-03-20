@@ -9,7 +9,7 @@ No external dependencies — works by directly swapping `~/.claude/.credentials.
 ## Features
 
 - **Tray icon** — Claude's own icon with a colored account badge (turns `!` red when rate limited); rendered at 128px for sharp display on HiDPI screens
-- **Real account info** — reads live email and org from `claude auth status` every 30 seconds; no stale display after switching
+- **Real account info** — reads live email, org, and subscription type from `claude auth status` every 30 seconds; stored per-account so each account always shows its own plan
 - **Switch accounts** — click an account; credentials are swapped, Electron profile cache is cleared, and Claude Code restarts automatically
 - **Rate limit tracking** — auto-detected from Claude logs; mark/clear manually via submenu
 - **Add / Remove accounts** — saves/restores the current logged-in session
@@ -95,7 +95,7 @@ Repeat for each account. Saved credentials are stored in `~/.claude/accounts/`.
 Right-click the tray icon — the menu shows all accounts:
 
 ```
-●  guberm@gmail.com [Personal]
+●  guberm@gmail.com [Michael Guber · enterprise]
 
 ✓  guberm@gmail.com
      michael.guber@trip-arc.com  ⚠ rate limited
@@ -108,7 +108,7 @@ Restart Claude Code
 Quit
 ```
 
-The header shows the live email and org — updated every 30 seconds and immediately after each switch.
+The header shows the live email, org, and subscription type — updated every 30 seconds and immediately after each switch.
 
 Click an account to switch — credentials are swapped and Claude Code restarts automatically.
 
