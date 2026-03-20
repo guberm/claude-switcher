@@ -369,16 +369,8 @@ def get_auth_status() -> dict | None:
 
 
 def _format_plan(status: dict | None) -> str:
-    if not status:
-        return ""
-    parts = []
-    org = (status.get("orgName") or "").strip()
-    sub = (status.get("subscriptionType") or "").replace("_", " ").strip()
-    if org:
-        parts.append(org)
-    if sub:
-        parts.append(sub)
-    return f" [{' · '.join(parts)}]" if parts else ""
+    org = (status.get("orgName") or "").strip() if status else ""
+    return f" [{org}]" if org else ""
 
 
 def clear_electron_profile_cache():

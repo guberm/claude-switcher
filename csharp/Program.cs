@@ -160,12 +160,7 @@ class TrayContext : ApplicationContext
     }
 
     static string FormatPlan(string? orgName, string? subType)
-    {
-        var parts = new List<string>();
-        if (orgName is { Length: > 0 } org) parts.Add(org);
-        if (subType is { Length: > 0 } t) parts.Add(t.Replace("_", " "));
-        return parts.Count > 0 ? $" [{string.Join(" · ", parts)}]" : "";
-    }
+        => orgName is { Length: > 0 } org ? $" [{org}]" : "";
 
     static string FormatPlan(AuthStatus? s) => FormatPlan(s?.OrgName, s?.SubscriptionType);
 
